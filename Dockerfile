@@ -3,6 +3,8 @@ ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
 
 # Build the manager binary
 FROM ${BUILDER_IMAGE} AS builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} as builder
+
 ARG TARGETOS
 ARG TARGETARCH
 
