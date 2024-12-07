@@ -299,7 +299,7 @@ spec:
   - email: kehannon@redhat.com
     name: kevinhannon
   maturity: alpha
-  minKubeVersion: 1.32.0
+  minKubeVersion: 1.27.0
   provider:
     name: openshift
   version: 0.0.1
