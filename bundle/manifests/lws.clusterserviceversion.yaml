@@ -184,7 +184,7 @@ spec:
                 - --zap-log-level=2
                 command:
                 - /manager
-                image: quay.io/redhat-user-workloads/kueue-workloads-tenant/kubernetes-sigs-lws@sha256:89f45f5bf6259244e6d9151a2bbf7d465992d62a12d7639840d85fb5f2ab96d9
+                image: quay.io/redhat-user-workloads/kueue-workloads-tenant/kubernetes-sigs-lws@sha256:ba46f2ed9fdfef75ba81f60b28c8175a62bb9389507c8e17b886cd32cfa3d2ad
                 livenessProbe:
                   httpGet:
                     path: /healthz
