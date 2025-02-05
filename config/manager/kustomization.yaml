@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: gcr.io/k8s-staging-lws/lws
-  newTag: v0.4.0-65-g6367828-dirty
+  newTag: main
