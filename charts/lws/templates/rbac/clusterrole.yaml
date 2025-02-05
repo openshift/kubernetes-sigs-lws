@@ -28,10 +28,20 @@ rules:
   - apiGroups:
       - ""
     resources:
-      - pods
       - services
     verbs:
       - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
       - delete
       - get
       - list
@@ -66,6 +76,7 @@ rules:
   - apiGroups:
       - apps
     resources:
+      - controllerrevisions
       - statefulsets
     verbs:
       - create
@@ -78,12 +89,14 @@ rules:
   - apiGroups:
       - apps
     resources:
+      - controllerrevisions/finalizers
       - statefulsets/finalizers
     verbs:
       - update
   - apiGroups:
       - apps
     resources:
+      - controllerrevisions/status
       - statefulsets/status
     verbs:
       - get
