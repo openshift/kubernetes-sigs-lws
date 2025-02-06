@@ -1,5 +1,11 @@
-# See the OWNERS docs at https://go.k8s.io/owners
-
-approvers:
+reviewers:
+  - ardaguclu
+  - atiratree
   - kannon92
   - mrunalp
+approvers:
+  - ardaguclu
+  - atiratree
+  - kannon92
+  - mrunalp
+component: "kubernetes-sigs-lws"
