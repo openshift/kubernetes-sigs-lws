@@ -2,7 +2,7 @@
 GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod|head -n1)
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.30.0
+ENVTEST_K8S_VERSION = 1.32.0
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -11,6 +11,7 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
+GO_CMD ?= go
 # CONTAINER_TOOL defines the container tool to be used for building images.
 # Be aware that the target commands are only tested with Docker which is
 # scaffolded by default. However, you might want to replace it to use other
@@ -52,12 +53,16 @@ endif
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
+version_pkg = sigs.k8s.io/lws/pkg/version
+LD_FLAGS += -X '$(version_pkg).GitVersion=$(GIT_TAG)'
+LD_FLAGS += -X '$(version_pkg).GitCommit=$(shell git rev-parse HEAD)'
+
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
 ARTIFACTS ?= $(PROJECT_DIR)/bin
 
 INTEGRATION_TARGET ?= ./test/integration/...
 
-E2E_KIND_VERSION ?= kindest/node:v1.30.0
+E2E_KIND_VERSION ?= kindest/node:v1.32.0
 USE_EXISTING_CLUSTER ?= false
 
 # For local testing, we should allow user to use different kind cluster name
@@ -112,12 +117,12 @@ vet: ## Run go vet against code.
 .PHONY: test
 test: manifests fmt vet envtest gotestsum ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
-	$(GOTESTSUM) --junitfile $(ARTIFACTS)/junit.xml -- ./api/... ./pkg/... -coverprofile  $(ARTIFACTS)/cover.out
+	$(GOTESTSUM) --junitfile $(ARTIFACTS)/junit.xml -- ./api/... ./pkg/... ./cmd/... -coverprofile  $(ARTIFACTS)/cover.out
 
 KIND = $(shell pwd)/bin/kind
 .PHONY: kind
 kind:
-	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on go install sigs.k8s.io/kind@v0.23.0
+	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on go install sigs.k8s.io/kind@v0.26.0
 
 .PHONY: kind-image-build
 kind-image-build: PLATFORMS=linux/amd64
@@ -147,7 +152,7 @@ verify: lint toc-verify
 
 .PHONY: build
 build: manifests fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	$(GO_BUILD_ENV) $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests fmt vet ## Run a controller from your host.

@@ -62,7 +62,7 @@ internalCertManagement:
 		cmpopts.IgnoreUnexported(webhook.DefaultServer{}),
 		cmpopts.IgnoreUnexported(ctrlcache.Options{}),
 		cmpopts.IgnoreUnexported(net.ListenConfig{}),
-		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger", "Metrics", "WebhookServer"),
+		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger", "Metrics", "WebhookServer", "LeaderElectionNamespace"),
 	}
 
 	testCases := []struct {
@@ -105,6 +105,8 @@ internalCertManagement:
 				RenewDeadline:              ptr.To(1 * time.Minute),
 				RetryPeriod:                ptr.To(1 * time.Minute),
 				HealthProbeBindAddress:     ":9443",
+				LivenessEndpointName:       "/healthz",
+				ReadinessEndpointName:      "/readyz",
 			},
 		},
 		{
@@ -126,6 +128,8 @@ internalCertManagement:
 				RenewDeadline:              ptr.To(5 * time.Minute),
 				RetryPeriod:                ptr.To(5 * time.Minute),
 				HealthProbeBindAddress:     ":8081",
+				LivenessEndpointName:       "/healthz",
+				ReadinessEndpointName:      "/readyz",
 			},
 		},
 		{
@@ -150,6 +154,8 @@ internalCertManagement:
 				RenewDeadline:              ptr.To(5 * time.Minute),
 				RetryPeriod:                ptr.To(5 * time.Minute),
 				HealthProbeBindAddress:     ":9443",
+				LivenessEndpointName:       "/healthz",
+				ReadinessEndpointName:      "/readyz",
 			},
 		},
 	}
@@ -164,7 +170,8 @@ internalCertManagement:
 				tc.leaderElectRenewDeadline,
 				tc.leaderElectRetryPeriod,
 				tc.leaderElectResourceLock,
-				tc.leaderElectionID)
+				tc.leaderElectionID,
+				"metrics-addr")
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
