@@ -3,21 +3,21 @@ ARG BASE_IMAGE=registry.redhat.io/rhel9-4-els/rhel-minimal:9.4
 
 # Build the manager binary
 FROM ${BUILDER_IMAGE} AS builder
-
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETPLATFORM
 
-ENV GOEXPERIMENT=strictfipsruntime
-
 WORKDIR /workspace
 COPY . .
 
-RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -tags strictfipsruntime -mod=vendor -a -o manager cmd/main.go
+ENV GOEXPERIMENT=strictfipsruntime
+ENV GOFLAGS="-tags=strictfipsruntime -mod=vendor -a"
+
+RUN make build GO_BUILD_ENV='CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH}'
 
 FROM --platform=$TARGETPLATFORM ${BASE_IMAGE}
 WORKDIR /
-COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/bin/manager .
 RUN mkdir /licenses
 COPY --from=builder /workspace/LICENSE /licenses/.
 USER 65532:65532
