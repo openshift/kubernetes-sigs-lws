@@ -5,7 +5,7 @@
 *.dll
 *.so
 *.dylib
-bin
+bin/*
 testbin/*
 artifacts
 .DS_Store
@@ -29,3 +29,5 @@ artifacts
 
 # Directory with CRDs for dependencies
 dep-crds
+
+!bin/controller-gen
