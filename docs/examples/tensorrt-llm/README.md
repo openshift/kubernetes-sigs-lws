@@ -21,7 +21,7 @@ kubectl apply -f rbac.yaml
 
 ## Deploy LeaderWorkerSet of TensorRT-LLM
 
-We use LeaderWorkerSet to deploy the TensorRT-LLM server, each replica has 2 pods (pipeline_parallel_size=2) and 8 GPUs (tensor_parallel_size=8) per pod. The leader pod runs the http server, with a ClusterIP Service exposing the port. 
+We use LeaderWorkerSet to deploy the TensorRT-LLM server, each replica has 2 pods (pipeline_parallel_size=2) and 8 GPUs (tensor_parallel_size=8) per pod. The leader pod runs the http server. 
 
 ```shell
 kubectl apply -f lws.yaml
@@ -41,7 +41,13 @@ tensorrt-0                                 1/1     Running   0          31m
 tensorrt-0-1                               1/1     Running   0          31m
 ```
 
-## Access cluster IP service
+## Deploy cluster IP service
+
+Apply the `service.yaml` manifest:
+
+```shell
+kubectl apply -f service.yaml
+```
 
 Use `kubectl port-forward` to forward local port 8000 to a pod.
 
