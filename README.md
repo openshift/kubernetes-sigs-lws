@@ -6,12 +6,16 @@
 [GoReport Widget]: https://goreportcard.com/badge/github.com/kubernetes-sigs/lws
 [GoReport Status]: https://goreportcard.com/report/github.com/kubernetes-sigs/lws
 
+<img src="https://github.com/kubernetes-sigs/lws/blob/main/site/static/images/logo.svg" width="100" alt="lws logo">
+
 LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. It aims to address common deployment patterns of AI/ML inference workloads, especially multi-host inference workloads where the LLM will be sharded and run across multiple devices on multiple nodes.
 The initial design and proposal can be found at: <http://bit.ly/k8s-LWS>.
 
+Read the [documentation](https://lws.sigs.k8s.io/docs/) or watch the LWS-related [talks & presentations](https://lws.sigs.k8s.io/docs/adoption/#talks-and-presentations) to learn more.
+
 ## Conceptual view
 
-![image](https://github.com/kubernetes-sigs/lws/assets/9022859/afe68191-609c-4b34-b992-107838002e0a)
+![image](https://github.com/user-attachments/assets/5c413f5d-8c34-488f-b92e-339273555a7d)
 
 ## Feature overview
 
@@ -27,13 +31,13 @@ The initial design and proposal can be found at: <http://bit.ly/k8s-LWS>.
 
 ## Installation
 
-Read the [installation guide](/docs/setup/install.md) to learn more.
+Read the [installation guide](/site/content/en/docs/installation/_index.md) to learn more.
 
 ## Examples
 
 Read the [examples](/docs/examples/sample/README.md) to learn more.
 
-Also discover adopters, integrations, and talks [here](/docs/adoption/README.md).
+Also discover adopters, integrations, and talks [here](/site/content/en/docs/adoption/_index.md).
 
 ## Community, discussion, contribution, and support
 

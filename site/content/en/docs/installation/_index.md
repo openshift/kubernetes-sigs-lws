@@ -1,4 +1,24 @@
-# Installation
+---
+title: "Installation"
+linkTitle: "Installation"
+weight: 2
+description: >
+  Installing LWS to a Kubernetes Cluster
+---
+
+<!-- toc -->
+- [Before you begin](##before-you-begin)
+- [Install a released version](#install-a-released-version)
+  - [Uninstall](#uninstall)
+- [Install the latest development version](#install-the-latest-development-version)
+  - [Uninstall](#uninstall-1)
+- [Build and install from source](#build-and-install-from-source)
+  - [Uninstall](#uninstall-2)
+- [Install in a different namespace](#install-in-a-different-namespace)
+- [Use Cert Manager instead of internal cert](#optional-use-cert-manager-instead-of-internal-cert)
+
+<!-- /toc -->
+
 
 ## Before you begin
 
@@ -97,7 +117,7 @@ Finally, install the cert manager follwing the link: https://cert-manager.io/doc
 and apply these configurations to your cluster with ``kubectl apply --server-side -k config/default``.
 
 # Install with helm chart
-See [lws/charts](../../charts/lws/README.md)
+See [lws/charts](https://github.com/kubernetes-sigs/lws/tree/main/charts/lws)
 
 [feature_gate]: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 [start_ordinal]: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#start-ordinal

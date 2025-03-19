@@ -104,8 +104,18 @@ func (lwsWrapper *LeaderWorkerSetWrapper) Conditions(conditions []metav1.Conditi
 }
 
 func (lwsWrapper *LeaderWorkerSetWrapper) SubGroupSize(subGroupSize int32) *LeaderWorkerSetWrapper {
-	lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy = &leaderworkerset.SubGroupPolicy{}
+	if lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy == nil {
+		lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy = &leaderworkerset.SubGroupPolicy{}
+	}
 	lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize = &subGroupSize
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) SubGroupType(subGroupType leaderworkerset.SubGroupPolicyType) *LeaderWorkerSetWrapper {
+	if lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy == nil {
+		lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy = &leaderworkerset.SubGroupPolicy{}
+	}
+	lwsWrapper.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type = &subGroupType
 	return lwsWrapper
 }
 
@@ -192,7 +202,7 @@ func MakeWorkerPodSpec() corev1.PodSpec {
 		Containers: []corev1.Container{
 			{
 				Name:  "leader",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
 						ContainerPort: 8080,
@@ -247,7 +257,7 @@ func MakeWorkerPodSpecWithTPUResource() corev1.PodSpec {
 		Containers: []corev1.Container{
 			{
 				Name:  "leader",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
 						ContainerPort: 8080,
@@ -273,7 +283,7 @@ func MakeLeaderPodSpec() corev1.PodSpec {
 		Containers: []corev1.Container{
 			{
 				Name:  "worker",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 			},
 		},
 	}
@@ -310,7 +320,7 @@ func MakeLeaderPodSpecWithTPUResourceMultipleContainers() corev1.PodSpec {
 			},
 			{
 				Name:  "leader",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
 						ContainerPort: 8080,
@@ -328,7 +338,7 @@ func MakeWorkerPodSpecWithVolume() corev1.PodSpec {
 		Containers: []corev1.Container{
 			{
 				Name:  "leader",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
 						ContainerPort: 8080,
@@ -350,7 +360,7 @@ func MakeWorkerPodSpecWithVolumeAndNilImage() corev1.PodSpec {
 		Containers: []corev1.Container{
 			{
 				Name:  "leader",
-				Image: "nginx:1.14.2",
+				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
 						ContainerPort: 8080,
