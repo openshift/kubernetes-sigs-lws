@@ -1,3 +1,16 @@
+---
+title: "Adopters"
+linkTitle: "Adopters"
+weight: 30
+menu:
+  main:
+    weight: 30
+description: >
+  Where LWS is used and integrated in
+aliases:
+- /adopters
+---
+
 # Adopters, Integrations and Presentations
 
 ## Adopters
@@ -23,6 +36,9 @@
 [**llmaz**](https://github.com/InftyAI/llmaz): llmaz, serving as an easy to use and advanced inference platform, uses LeaderWorkerSet as the underlying workload to support both single-host and multi-host inference scenarios.
 
 [**vLLM**](https://github.com/vllm-project/vllm): vLLM is a fast and easy-to-use library for LLM inference, it can be deployed with LWS on Kubernetes for distributed model serving, see documentation [here](https://docs.vllm.ai/en/stable/deployment/frameworks/lws.html).
+
+[**sglang**](https://github.com/sgl-project/sglang): sglang, a fast serving framework for large language models and vision language models. It can be deployed with LWS on Kubernetes for 
+distributed model serving, see documentation [here](https://docs.sglang.ai/references/deploy_on_k8s.html#deploy-on-kubernetes)
 
 ## Talks and Presentations
 

@@ -113,7 +113,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 							Containers: []coreapplyv1.ContainerApplyConfiguration{
 								{
 									Name:      ptr.To[string]("leader"),
-									Image:     ptr.To[string]("nginx:1.14.2"),
+									Image:     ptr.To[string]("nginxinc/nginx-unprivileged:1.27"),
 									Ports:     []coreapplyv1.ContainerPortApplyConfiguration{{ContainerPort: ptr.To[int32](8080), Protocol: ptr.To[corev1.Protocol](corev1.ProtocolTCP)}},
 									Resources: &coreapplyv1.ResourceRequirementsApplyConfiguration{},
 								},
@@ -182,7 +182,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 							Containers: []coreapplyv1.ContainerApplyConfiguration{
 								{
 									Name:      ptr.To[string]("leader"),
-									Image:     ptr.To[string]("nginx:1.14.2"),
+									Image:     ptr.To[string]("nginxinc/nginx-unprivileged:1.27"),
 									Ports:     []coreapplyv1.ContainerPortApplyConfiguration{{ContainerPort: ptr.To[int32](8080), Protocol: ptr.To[corev1.Protocol](corev1.ProtocolTCP)}},
 									Resources: &coreapplyv1.ResourceRequirementsApplyConfiguration{},
 								},
@@ -251,7 +251,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 							Containers: []coreapplyv1.ContainerApplyConfiguration{
 								{
 									Name:      ptr.To[string]("worker"),
-									Image:     ptr.To[string]("nginx:1.14.2"),
+									Image:     ptr.To[string]("nginxinc/nginx-unprivileged:1.27"),
 									Resources: &coreapplyv1.ResourceRequirementsApplyConfiguration{},
 								},
 							},
@@ -317,7 +317,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 							Containers: []coreapplyv1.ContainerApplyConfiguration{
 								{
 									Name:      ptr.To[string]("leader"),
-									Image:     ptr.To[string]("nginx:1.14.2"),
+									Image:     ptr.To[string]("nginxinc/nginx-unprivileged:1.27"),
 									Ports:     []coreapplyv1.ContainerPortApplyConfiguration{{ContainerPort: ptr.To[int32](8080), Protocol: ptr.To[corev1.Protocol](corev1.ProtocolTCP)}},
 									Resources: &coreapplyv1.ResourceRequirementsApplyConfiguration{},
 								},
@@ -337,7 +337,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 			revisionKey: revisionKey1,
 			lws: wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").Annotation(map[string]string{
 				leaderworkerset.SubGroupExclusiveKeyAnnotationKey: "topologyKey",
-			}).SubGroupSize(2).Replica(1).
+			}).SubGroupSize(2).SubGroupType(leaderworkerset.SubGroupPolicyTypeLeaderWorker).Replica(1).
 				RolloutStrategy(leaderworkerset.RolloutStrategy{
 					Type: leaderworkerset.RollingUpdateStrategyType,
 					RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
@@ -381,13 +381,14 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 								"leaderworkerset.sigs.k8s.io/size":                "2",
 								leaderworkerset.SubGroupSizeAnnotationKey:         "2",
 								leaderworkerset.SubGroupExclusiveKeyAnnotationKey: "topologyKey",
+								leaderworkerset.SubGroupPolicyTypeAnnotationKey:   string(leaderworkerset.SubGroupPolicyTypeLeaderWorker),
 							},
 						},
 						Spec: &coreapplyv1.PodSpecApplyConfiguration{
 							Containers: []coreapplyv1.ContainerApplyConfiguration{
 								{
 									Name:      ptr.To[string]("worker"),
-									Image:     ptr.To[string]("nginx:1.14.2"),
+									Image:     ptr.To[string]("nginxinc/nginx-unprivileged:1.27"),
 									Resources: &coreapplyv1.ResourceRequirementsApplyConfiguration{},
 								},
 							},
