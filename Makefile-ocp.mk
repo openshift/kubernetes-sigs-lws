@@ -10,3 +10,7 @@ verify-ocp: manifests
 .PHONY: build-ocp
 build-ocp: fmt vet
 	$(GO_BUILD_ENV) $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/manager cmd/main.go
+
+.PHONY: test-e2e-ocp
+test-e2e-ocp: kustomize manifests fmt vet envtest ginkgo
+	KUSTOMIZE=$(KUSTOMIZE) GINKGO=$(GINKGO) ARTIFACTS=$(ARTIFACTS) ./hack/e2e-test-ocp.sh
