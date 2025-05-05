@@ -87,6 +87,10 @@ spec:
         name: skip-checks
         type: string
       - default: "true"
+        description: Skip checks against built image
+        name: skip-coverity-checks
+        type: string
+      - default: "true"
         description: Execute the build with network isolation
         name: hermetic
         type: string
@@ -477,7 +481,7 @@ spec:
               value: task
           resolver: bundles
         when:
-          - input: $(params.skip-checks)
+          - input: $(params.skip-coverity-checks)
             operator: in
             values:
               - "false"
@@ -498,7 +502,7 @@ spec:
               value: task
           resolver: bundles
         when:
-          - input: $(params.skip-checks)
+          - input: $(params.skip-coverity-checks)
             operator: in
             values:
               - "false"
