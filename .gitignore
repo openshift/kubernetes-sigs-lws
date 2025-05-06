@@ -24,9 +24,6 @@ artifacts
 *.swo
 *~
 
-# vendor files
-vendor
-
 # Local Netlify folder
 .netlify
 
