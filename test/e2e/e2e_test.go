@@ -314,6 +314,9 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 	serviceAccountName := "lws-controller-manager"
 	metricsServiceName := "lws-controller-manager-metrics-service"
 	namespace := "lws-system"
+	if ns := os.Getenv("LWS_NAMESPACE"); ns != "" {
+		namespace = ns
+	}
 	var controllerPodName string
 
 	ginkgo.It("should ensure the metrics endpoint is serving metrics", func() {
@@ -386,7 +389,7 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		ginkgo.By("getting the metrics by checking curl-metrics logs")
 		metricsOutput := getMetricsOutput(namespace)
 		gomega.Expect(metricsOutput).To(gomega.ContainSubstring(
-			"controller_runtime_reconcile_total",
+			"controller_runtime_webhook_requests_total",
 		))
 
 		ginkgo.By("cleaning up the curl-metrics job")

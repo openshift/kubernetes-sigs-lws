@@ -24,19 +24,42 @@ Quick start instructions for the setup and configuration of lws using Helm.
 
 ##### Install chart using Helm v3.0+
 
+You can install the chart using one of the following methods:
+
+**From source**:
+
 ```bash
-$ git clone git@github.com:kubernetes-sigs/lws.git
-$ cd charts
-$ helm install lws lws --create-namespace --namespace lws-system
+git clone git@github.com:kubernetes-sigs/lws.git
+cd charts
+helm install lws lws --create-namespace --namespace lws-system
 ```
+
+**From the OCI registry**:
+
+Alternatively, you can use the charts available at `oci://registry.k8s.io/lws/charts/lws`. For more details, refer to the [Helm chart installation documentation](https://lws.sigs.k8s.io/docs/installation/#install-by-helm).
 
 ##### Verify that controller pods are running properly.
 
 ```bash
-$ kubectl get deploy -n lws-system
+kubectl get deploy -n lws-system
 NAME                          READY   UP-TO-DATE   AVAILABLE   AGE
 lws-system-controller-manager   1/1     1            1           14s
 ```
+
+##### Cert Manager
+
+LWS has support for third-party certificates.
+One can enable this by setting `enableCertManager` to true.
+This will use certManager to generate a secret, inject the CABundles and set up the tls.
+
+Check out the [site](https://lws.sigs.k8s.io/docs/manage/cert_manager/)
+for more information on installing cert manager with our Helm chart.
+
+##### Prometheus
+
+LWS supports prometheus metrics.
+Check out the [site](https://lws.sigs.k8s.io/docs/manage/prometheus/)
+for more information on installing LWS with metrics using our Helm chart.
 
 ### Configuration
 

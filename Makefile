@@ -12,6 +12,7 @@ GOBIN=$(shell go env GOBIN)
 endif
 
 GO_CMD ?= go
+GO_FMT ?= gofmt
 # CONTAINER_TOOL defines the container tool to be used for building images.
 # Be aware that the target commands are only tested with Docker which is
 # scaffolded by default. However, you might want to replace it to use other
@@ -35,7 +36,7 @@ IMAGE_REGISTRY ?= ${STAGING_IMAGE_REGISTRY}/lws
 IMAGE_NAME := lws
 IMAGE_REPO := $(IMAGE_REGISTRY)/$(IMAGE_NAME)
 IMG ?= $(IMAGE_REPO):$(GIT_TAG)
-HELM_CHART_REPO := ${STAGING_IMAGE_REGISTRY}/charts
+HELM_CHART_REPO := ${STAGING_IMAGE_REGISTRY}/lws/charts
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 BASE_IMAGE ?= gcr.io/distroless/static:nonroot
@@ -64,11 +65,30 @@ ARTIFACTS ?= $(PROJECT_DIR)/bin
 INTEGRATION_TARGET ?= ./test/integration/...
 
 E2E_KIND_VERSION ?= kindest/node:v1.32.0
+CERT_MANAGER_VERSION ?= v1.17.0
 USE_EXISTING_CLUSTER ?= false
 
 # For local testing, we should allow user to use different kind cluster name
 # Default will delete default kind cluster
 KIND_CLUSTER_NAME ?= kind
+
+# Setting SED allows macos users to install GNU sed and use the latter
+# instead of the default BSD sed.
+ifeq ($(shell command -v gsed 2>/dev/null),)
+    SED ?= $(shell command -v sed)
+else
+    SED ?= $(shell command -v gsed)
+endif
+ifeq ($(shell ${SED} --version 2>&1 | grep -q GNU; echo $$?),1)
+    $(error !!! GNU sed is required. If on OS X, use 'brew install gnu-sed'.)
+endif
+
+# Update these variables when preparing a new release or a release branch.
+# Then run `make prepare-release-branch`
+RELEASE_VERSION=v0.6.1
+RELEASE_BRANCH=main
+# Version used form Helm which is not using the leading "v"
+CHART_VERSION := $(shell echo $(RELEASE_VERSION) | cut -c2-)
 
 .PHONY: all
 all: build
@@ -102,13 +122,26 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 		paths="{./api/..., ./pkg/...}"
 
 .PHONY: generate
-generate: controller-gen code-generator ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations and client-go libraries.
+generate: controller-gen code-generator generate-apiref ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations and client-go libraries.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
 	./hack/update-codegen.sh $(GO_CMD) $(PROJECT_DIR)/bin
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	$(GO_CMD) fmt ./...
+
+.PHONY: fmt-verify
+fmt-verify:
+	@out=`$(GO_FMT) -w -l -d $$(find . -name '*.go' | grep -v /vendor/)`; \
+	if [ -n "$$out" ]; then \
+	    echo "$$out"; \
+	    exit 1; \
+	fi
+
+.PHONY: gomod-verify
+gomod-verify:
+	$(GO_CMD) mod tidy
+	git --no-pager diff --exit-code go.mod go.sum
 
 .PHONY: vet
 vet: ## Run go vet against code.
@@ -138,6 +171,10 @@ test-integration: manifests fmt vet envtest ginkgo ## Run integration tests.
 test-e2e: kustomize manifests fmt vet envtest ginkgo kind-image-build
 	E2E_KIND_VERSION=$(E2E_KIND_VERSION) KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) GINKGO=$(GINKGO) USE_EXISTING_CLUSTER=$(USE_EXISTING_CLUSTER) IMAGE_TAG=$(IMG) ARTIFACTS=$(ARTIFACTS) ./hack/e2e-test.sh
 
+.PHONY: test-e2e-cert-manager
+test-e2e-cert-manager: kustomize manifests fmt vet envtest ginkgo kind-image-build
+	USE_CERT_MANAGER=true CERT_MANAGER_VERSION=$(CERT_MANAGER_VERSION) E2E_KIND_VERSION=$(E2E_KIND_VERSION) KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) GINKGO=$(GINKGO) USE_EXISTING_CLUSTER=$(USE_EXISTING_CLUSTER) IMAGE_TAG=$(IMG) ARTIFACTS=$(ARTIFACTS) ./hack/e2e-test.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter & yamllint
 	$(GOLANGCI_LINT) run --timeout 15m0s
@@ -146,10 +183,13 @@ lint: golangci-lint ## Run golangci-lint linter & yamllint
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
+PATHS_TO_VERIFY := config/components api client-go site/ charts/
 .PHONY: verify
-verify: lint toc-verify
-##@ Build
+verify: gomod-verify lint fmt-verify toc-verify manifests generate prepare-release-branch
+	git --no-pager diff --exit-code $(PATHS_TO_VERIFY)
+	if git ls-files --exclude-standard --others $(PATHS_TO_VERIFY) | grep -q . ; then exit 1; fi
 
+##@ Build
 .PHONY: build
 build: manifests fmt vet ## Build manager binary.
 	$(GO_BUILD_ENV) $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/manager cmd/main.go
@@ -183,6 +223,8 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 ifndef ignore-not-found
   ignore-not-found = false
 endif
+
+clean-manifests = (cd config/manager && $(KUSTOMIZE) edit set image controller=us-central1-docker.pkg.dev/k8s-staging-images/lws/lws:$(RELEASE_BRANCH))
 
 .PHONY: install
 install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
@@ -243,7 +285,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
 $(ENVTEST): $(LOCALBIN)
-	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.20
+	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) $(GO_CMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 
 GINKGO = $(shell pwd)/bin/ginkgo
 .PHONY: ginkgo
@@ -270,20 +312,29 @@ code-generator:
 
 ##@ Release
 .PHONY: artifacts
-artifacts: kustomize helm
+artifacts: kustomize helm yq
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	if [ -d artifacts ]; then rm -rf artifacts; fi
 	mkdir -p artifacts
 	$(KUSTOMIZE) build config/default -o artifacts/manifests.yaml
 	@$(call clean-manifests)
 	# Update the image tag and policy
-	$(YQ)  e  '.image.repository = "$(IMAGE_REPO)" | .image.tag = "$(GIT_TAG)" | .image.pullPolicy = "IfNotPresent"' -i charts/lws/values.yaml
+	$(YQ)  e  '.image.manager.repository = "$(IMAGE_REPO)" | .image.manager.tag = "$(GIT_TAG)" | .image.manager.pullPolicy = "IfNotPresent"' -i charts/lws/values.yaml
 	# create the package. TODO: consider signing it
 	$(HELM) package --version $(GIT_TAG) --app-version $(GIT_TAG) charts/lws -d artifacts/
 	mv artifacts/lws-$(GIT_TAG).tgz artifacts/lws-chart-$(GIT_TAG).tgz
 	# Revert the image changes
-	$(YQ)  e  '.image.repository = "$(IMAGE_REGISTRY)/$(IMAGE_NAME)" | del(.image.tag) | .image.pullPolicy = "Always"' -i charts/lws/values.yaml
+	$(YQ)  e  '.image.manager.repository = "$(IMAGE_REGISTRY)/$(IMAGE_NAME)" | .image.manager.tag = "main" | .image.manager.pullPolicy = "Always"' -i charts/lws/values.yaml
 
+
+.PHONY: prepare-release-branch
+prepare-release-branch: yq kustomize ## Prepare the release branch with the release version.
+	$(SED) -r 's/v[0-9]+\.[0-9]+\.[0-9]+/$(RELEASE_VERSION)/g' -i README.md -i site/config.toml
+	$(SED) -r 's/--version="v?[0-9]+\.[0-9]+\.[0-9]+/--version="$(CHART_VERSION)/g' -i charts/lws/README.md
+	$(SED) -r 's/\bVERSION=(\s*)v?[0-9]+\.[0-9]+\.[0-9]+\b/VERSION=\1$(RELEASE_VERSION)/g' -i site/content/en/docs/installation/_index.md
+	$(SED) -r 's/\bCHART_VERSION=(\s*)v?[0-9]+\.[0-9]+\.[0-9]+\b/CHART_VERSION=\1$(CHART_VERSION)/g' -i site/content/en/docs/installation/_index.md
+	$(YQ) e '.appVersion = "$(RELEASE_VERSION)"' -i charts/lws/Chart.yaml
+	@$(call clean-manifests)
 
 .PHONY: prometheus
 prometheus:
