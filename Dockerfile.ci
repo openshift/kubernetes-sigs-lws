@@ -1,4 +1,4 @@
-ARG BUILDER_IMAGE=registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.23-openshift-4.19
+ARG BUILDER_IMAGE=registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.24-openshift-4.20
 ARG BASE_IMAGE=registry.ci.openshift.org/ocp/4.19:base-rhel9
 
 # Build the manager binary
