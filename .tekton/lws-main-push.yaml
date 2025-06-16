@@ -7,8 +7,23 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: "false"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
-      == "main"
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push" 
+      && target_branch == "main" 
+      && (
+      ".tekton/lws-main-pull-request.yaml".pathChanged() 
+      || "api/***".pathChanged() 
+      || "client-go/***".pathChanged()
+      || "cmd/***".pathChanged() 
+      || "config/***".pathChanged()  
+      || "pkg/***".pathChanged() 
+      || "vendor/***".pathChanged()
+      || "Dockerfile.ocp".pathChanged() 
+      || "go.mod".pathChanged() 
+      || "Makefile".pathChanged()
+      || "Makefile-deps.mk".pathChanged()
+      || "Makefile-ocp.mk".pathChanged()
+      )
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: lws-main
