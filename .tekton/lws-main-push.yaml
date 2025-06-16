@@ -11,7 +11,7 @@ metadata:
       event == "push" 
       && target_branch == "main" 
       && (
-      ".tekton/lws-main-pull-request.yaml".pathChanged() 
+      ".tekton/lws-main-push.yaml".pathChanged() 
       || "api/***".pathChanged() 
       || "client-go/***".pathChanged()
       || "cmd/***".pathChanged() 
