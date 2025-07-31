@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -163,6 +164,23 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
 	})
 
+	ginkgo.It("Can perform a rolling update even if old lws not ready", func() {
+		// Create lws with not exist image.
+		lws := wrappers.BuildLeaderWorkerSet(ns.Name).LeaderTemplate(nil).Size(1).Replica(2).MaxSurge(1).MaxUnavailable(0).Obj()
+		lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.Containers[0].Image = "not-exist-image:v1"
+		testing.MustCreateLws(ctx, k8sClient, lws)
+
+		//Update lws.
+		testing.UpdateWorkerTemplateImage(ctx, k8sClient, lws)
+
+		// Rolling update completes.
+		testing.ExpectValidLeaderStatefulSet(ctx, k8sClient, lws, 2)
+		testing.ExpectValidWorkerStatefulSets(ctx, lws, k8sClient, true)
+		testing.ExpectValidPods(ctx, k8sClient, lws, &corev1.PodList{})
+		// Wait for leaderWorkerSet to be ready again.
+		testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
+	})
+
 	ginkgo.It("Can deploy lws with subgroupsize set", func() {
 		leaderPodSpec := wrappers.MakeLeaderPodSpecWithTPUResource()
 		workerPodSpec := wrappers.MakeWorkerPodSpecWithTPUResource()
@@ -221,6 +239,28 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		for _, p := range lwsPods.Items {
 			gomega.Expect(testing.HasTPUEnvVarsPopulated(p)).To(gomega.BeTrue())
 		}
+	})
+
+	ginkgo.It("When changing size, recreates the Pods with correct count and size annotation", func() {
+		replicas := 2
+		size := 2
+		lws := wrappers.BuildLeaderWorkerSet(ns.Name).Replica(replicas).Size(size).ResizePolicy(leaderworkerset.ResizePolicyRecreate).Obj()
+		testing.MustCreateLws(ctx, k8sClient, lws)
+
+		testing.ExpectValidLeaderStatefulSet(ctx, k8sClient, lws, int32(replicas))
+		testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
+
+		newSize := 3
+		testing.UpdateSize(ctx, k8sClient, lws, int32(newSize))
+		testing.ExpectLeaderWorkerSetAvailable(ctx, k8sClient, lws, "All replicas are ready")
+
+		lwsPods := &corev1.PodList{}
+		testing.ExpectValidPods(ctx, k8sClient, lws, lwsPods)
+
+		for _, p := range lwsPods.Items {
+			gomega.Expect(testing.CheckAnnotation(p, leaderworkerset.SizeAnnotationKey, strconv.Itoa(newSize))).To(gomega.Succeed())
+		}
+		gomega.Expect(len(lwsPods.Items) == newSize*replicas).To(gomega.BeTrue())
 	})
 
 	ginkgo.It("When changing subdomainPolicy, adds correct env vars", func() {

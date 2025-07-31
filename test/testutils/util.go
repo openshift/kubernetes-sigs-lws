@@ -392,6 +392,17 @@ func HasLWSEnvVarsPopulated(pod corev1.Pod) bool {
 	return hasAllEnvVarPopulated(pod, []string{leaderworkerset.LwsLeaderAddress, leaderworkerset.LwsGroupSize, leaderworkerset.LwsWorkerIndex})
 }
 
+func CheckAnnotation(pod corev1.Pod, key, val string) error {
+	podVal, exists := pod.ObjectMeta.Annotations[leaderworkerset.SizeAnnotationKey]
+	if !exists {
+		return errors.New("Pod annotation not set")
+	}
+	if podVal != val {
+		return fmt.Errorf("Pod annotation value is not correct, want: %v, got: %v", val, podVal)
+	}
+	return nil
+}
+
 func CheckContainerHasCorrectEnvVar(pod corev1.Pod, expect corev1.EnvVar) error {
 	for _, container := range pod.Spec.Containers {
 		for _, env := range container.Env {
@@ -501,6 +512,18 @@ func UpdateReplicaCount(ctx context.Context, k8sClient client.Client, lws *leade
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
 
+func UpdateSize(ctx context.Context, k8sClient client.Client, lws *leaderworkerset.LeaderWorkerSet, size int32) {
+	gomega.Eventually(func() error {
+		var leaderworkerset leaderworkerset.LeaderWorkerSet
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}, &leaderworkerset); err != nil {
+			return err
+		}
+
+		leaderworkerset.Spec.LeaderWorkerTemplate.Size = ptr.To(size)
+		return k8sClient.Update(ctx, &leaderworkerset)
+	}, Timeout, Interval).Should(gomega.Succeed())
+}
+
 func UpdateSubdomainPolicy(ctx context.Context, k8sClient client.Client, lws *leaderworkerset.LeaderWorkerSet, subdomainPolicy leaderworkerset.SubdomainPolicy) {
 	gomega.Eventually(func() error {
 		var newLws leaderworkerset.LeaderWorkerSet
@@ -526,6 +549,18 @@ func UpdateLeaderTemplate(ctx context.Context, k8sClient client.Client, leaderWo
 			lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Labels = map[string]string{}
 		}
 		lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.Containers[0].Name = "new-leader-name"
+		return k8sClient.Update(ctx, &lws)
+	}, Timeout, Interval).Should(gomega.Succeed())
+}
+
+func UpdateWorkerTemplateImage(ctx context.Context, k8sClient client.Client, leaderWorkerSet *leaderworkerset.LeaderWorkerSet) {
+	gomega.Eventually(func() error {
+		var lws leaderworkerset.LeaderWorkerSet
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: leaderWorkerSet.Name, Namespace: leaderWorkerSet.Namespace}, &lws); err != nil {
+			return err
+		}
+
+		lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.Containers[0].Image = "nginxinc/nginx-unprivileged:1.27"
 		return k8sClient.Update(ctx, &lws)
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
@@ -648,4 +683,16 @@ func GetNonEmptyLines(output string) []string {
 	}
 
 	return res
+}
+
+func SetLwsPartition(ctx context.Context, k8sClient client.Client, lws *leaderworkerset.LeaderWorkerSet, partition int32) {
+	gomega.Eventually(func() error {
+		var newLws leaderworkerset.LeaderWorkerSet
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}, &newLws); err != nil {
+			return err
+		}
+
+		newLws.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition = &partition
+		return k8sClient.Update(ctx, &newLws)
+	}, Timeout, Interval).Should(gomega.Succeed())
 }

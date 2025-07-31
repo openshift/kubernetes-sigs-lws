@@ -130,7 +130,7 @@ func (r *LeaderWorkerSetReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	lwsUpdated := updatedRevision != nil
 	if lwsUpdated {
-		revision, err = revisionutils.CreateRevision(ctx, r.Client, updatedRevision, lws)
+		revision, err = revisionutils.CreateRevision(ctx, r.Client, updatedRevision)
 		if err != nil {
 			log.Error(err, "Creating revision for updated LWS")
 			return ctrl.Result{}, err
@@ -251,10 +251,15 @@ func SetupIndexes(indexer client.FieldIndexer) error {
 //   - Otherwise, Replicas is equal to spec.Replicas
 //   - One exception here is when unready replicas of leaderWorkerSet is equal to MaxSurge,
 //     we should reclaim the extra replicas gradually to accommodate for the new replicas.
-func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, sts *appsv1.StatefulSet, revisionKey string, leaderWorkerSetUpdated bool) (int32, int32, error) {
+func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, sts *appsv1.StatefulSet, revisionKey string, leaderWorkerSetUpdated bool) (stsPartition int32, replicas int32, err error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("leaderworkerset", klog.KObj(lws))
 	ctx = ctrl.LoggerInto(ctx, log)
 	lwsReplicas := *lws.Spec.Replicas
+
+	defer func() {
+		// Limit the replicas with less than lwsPartition will not be updated.
+		stsPartition = max(stsPartition, *lws.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition)
+	}()
 
 	// Case 1:
 	// If sts not created yet, all partitions should be updated,
@@ -384,8 +389,10 @@ func (r *LeaderWorkerSetReconciler) updateConditions(ctx context.Context, lws *l
 	}
 
 	updateStatus := false
-	readyCount, updatedCount, updatedNonBurstWorkerCount, currentNonBurstWorkerCount, updatedAndReadyCount := 0, 0, 0, 0, 0
+	readyCount, updatedCount, readyNonBurstWorkerCount := 0, 0, 0
+	partitionedUpdatedNonBurstCount, partitionedCurrentNonBurstCount, partitionedUpdatedAndReadyCount := 0, 0, 0
 	noWorkerSts := *lws.Spec.LeaderWorkerTemplate.Size == 1
+	lwsPartition := *lws.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition
 
 	// Iterate through all leaderPods.
 	for _, pod := range leaderPodList.Items {
@@ -405,8 +412,8 @@ func (r *LeaderWorkerSetReconciler) updateConditions(ctx context.Context, lws *l
 			}
 		}
 
-		if index < int(*lws.Spec.Replicas) {
-			currentNonBurstWorkerCount++
+		if index < int(*lws.Spec.Replicas) && index >= int(lwsPartition) {
+			partitionedCurrentNonBurstCount++
 		}
 
 		var ready, updated bool
@@ -417,16 +424,18 @@ func (r *LeaderWorkerSetReconciler) updateConditions(ctx context.Context, lws *l
 		if (noWorkerSts || revisionutils.GetRevisionKey(&sts) == revisionKey) && revisionutils.GetRevisionKey(&pod) == revisionKey {
 			updated = true
 			updatedCount++
-			if index < int(*lws.Spec.Replicas) {
+			if index < int(*lws.Spec.Replicas) && index >= int(lwsPartition) {
 				// Bursted replicas do not count when determining if rollingUpdate has been completed.
-				updatedNonBurstWorkerCount++
+				partitionedUpdatedNonBurstCount++
 			}
 		}
 
-		if ready && updated {
-			// Bursted replicas should not be counted here.
-			if index < int(*lws.Spec.Replicas) {
-				updatedAndReadyCount++
+		if index < int(*lws.Spec.Replicas) {
+			if ready {
+				readyNonBurstWorkerCount++
+			}
+			if index >= int(lwsPartition) && ready && updated {
+				partitionedUpdatedAndReadyCount++
 			}
 		}
 	}
@@ -442,18 +451,19 @@ func (r *LeaderWorkerSetReconciler) updateConditions(ctx context.Context, lws *l
 	}
 
 	var conditions []metav1.Condition
-	updateDone := false
-	if updatedNonBurstWorkerCount < currentNonBurstWorkerCount {
+	if partitionedUpdatedNonBurstCount < partitionedCurrentNonBurstCount {
 		// upgradeInProgress is true when the upgrade replicas is smaller than the expected
 		// number of total replicas not including the burst replicas
 		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetUpdateInProgress))
 		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing))
-	} else if updatedAndReadyCount == int(*lws.Spec.Replicas) {
+	} else if readyNonBurstWorkerCount == int(*lws.Spec.Replicas) && partitionedUpdatedAndReadyCount == partitionedCurrentNonBurstCount {
 		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetAvailable))
-		updateDone = true
 	} else {
 		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing))
 	}
+
+	// updateDone is true when all replicas are updated and ready
+	updateDone := (lwsPartition == 0) && partitionedUpdatedAndReadyCount == int(*lws.Spec.Replicas)
 
 	updateCondition := setConditions(lws, conditions)
 	// if condition changed, record events
@@ -594,24 +604,24 @@ func rollingUpdatePartition(states []replicaState, stsReplicas int32, rollingSte
 	continuousReadyReplicas := calculateContinuousReadyReplicas(states)
 
 	// Update up to rollingStep replicas at once.
-	var rolliingStepPartition = utils.NonZeroValue(stsReplicas - continuousReadyReplicas - rollingStep)
+	var rollingStepPartition = utils.NonZeroValue(stsReplicas - continuousReadyReplicas - rollingStep)
 
 	// rollingStepPartition calculation above disregards the state of replicas with idx<rollingStepPartition.
 	// To prevent violating the maxUnavailable, we have to account for these replicas and increase the partition if some are not ready.
 	var unavailable int32
-	for idx := 0; idx < int(rolliingStepPartition); idx++ {
+	for idx := 0; idx < int(rollingStepPartition); idx++ {
 		if !states[idx].ready {
 			unavailable++
 		}
 	}
-	var partition = rolliingStepPartition + unavailable
+	var partition = rollingStepPartition + unavailable
 
 	// Reduce the partition if replicas are continously not ready. It is safe since updating these replicas does not impact
 	// the availability of the LWS. This is important to prevent update from getting stuck in case maxUnavailable is already violated
 	// (for example, all replicas are not ready when rolling update is started).
 	// Note that we never drop the partition below rolliingStepPartition.
-	for idx := min(partition, stsReplicas-1); idx >= rolliingStepPartition; idx-- {
-		if !states[idx].ready {
+	for idx := min(partition, stsReplicas-1); idx >= rollingStepPartition; idx-- {
+		if !states[idx].ready || states[idx].updated {
 			partition = idx
 		} else {
 			break
@@ -670,7 +680,7 @@ func (r *LeaderWorkerSetReconciler) getOrCreateRevisionIfNonExist(ctx context.Co
 	if err != nil {
 		return nil, err
 	}
-	newRevision, err := revisionutils.CreateRevision(ctx, r.Client, revision, lws)
+	newRevision, err := revisionutils.CreateRevision(ctx, r.Client, revision)
 	if err == nil {
 		message := fmt.Sprintf("Creating revision with key %s for a newly created LeaderWorkerSet", revision.Labels[leaderworkerset.RevisionKey])
 		if revisionKey != "" {

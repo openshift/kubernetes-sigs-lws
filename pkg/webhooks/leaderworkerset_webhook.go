@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -69,6 +70,7 @@ func (r *LeaderWorkerSetWebhook) Default(ctx context.Context, obj runtime.Object
 		lws.Spec.RolloutStrategy.RollingUpdateConfiguration = &v1.RollingUpdateConfiguration{
 			MaxUnavailable: intstr.FromInt32(1),
 			MaxSurge:       intstr.FromInt32(0),
+			Partition:      ptr.To[int32](0),
 		}
 	}
 
@@ -103,7 +105,9 @@ func (r *LeaderWorkerSetWebhook) ValidateUpdate(ctx context.Context, oldObj, new
 
 	oldLws := oldObj.(*v1.LeaderWorkerSet)
 	newLws := newObj.(*v1.LeaderWorkerSet)
-	allErrs = append(allErrs, apivalidation.ValidateImmutableField(*newLws.Spec.LeaderWorkerTemplate.Size, *oldLws.Spec.LeaderWorkerTemplate.Size, field.NewPath("spec", "leaderWorkerTemplate", "size"))...)
+	if newLws.Spec.LeaderWorkerTemplate.ResizePolicy == nil || *newLws.Spec.LeaderWorkerTemplate.ResizePolicy == v1.ResizePolicyNone {
+		allErrs = append(allErrs, apivalidation.ValidateImmutableField(*newLws.Spec.LeaderWorkerTemplate.Size, *oldLws.Spec.LeaderWorkerTemplate.Size, field.NewPath("spec", "leaderWorkerTemplate", "size"))...)
+	}
 	if newLws.Spec.LeaderWorkerTemplate.SubGroupPolicy != nil && oldLws.Spec.LeaderWorkerTemplate.SubGroupPolicy != nil {
 		allErrs = append(allErrs, apivalidation.ValidateImmutableField(*newLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize, *oldLws.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize, field.NewPath("spec", "leaderWorkerTemplate", "SubGroupPolicy", "subGroupSize"))...)
 	}

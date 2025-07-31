@@ -85,7 +85,7 @@ endif
 
 # Update these variables when preparing a new release or a release branch.
 # Then run `make prepare-release-branch`
-RELEASE_VERSION=v0.6.1
+RELEASE_VERSION=v0.6.2
 RELEASE_BRANCH=main
 # Version used form Helm which is not using the leading "v"
 CHART_VERSION := $(shell echo $(RELEASE_VERSION) | cut -c2-)
@@ -122,7 +122,7 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 		paths="{./api/..., ./pkg/...}"
 
 .PHONY: generate
-generate: controller-gen code-generator generate-apiref ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations and client-go libraries.
+generate: controller-gen code-generator generate-apiref crds ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations and client-go libraries.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
 	./hack/update-codegen.sh $(GO_CMD) $(PROJECT_DIR)/bin
 
@@ -155,7 +155,7 @@ test: manifests fmt vet envtest gotestsum ## Run tests.
 KIND = $(shell pwd)/bin/kind
 .PHONY: kind
 kind:
-	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install sigs.k8s.io/kind@v0.26.0
+	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install sigs.k8s.io/kind@v0.27.0
 
 .PHONY: kind-image-build
 kind-image-build: PLATFORMS=linux/amd64
@@ -244,7 +244,7 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: helm-chart-push
-helm-chart-push: yq helm
+helm-chart-push: yq helm crds
 	EXTRA_TAG="$(EXTRA_TAG)" GIT_TAG="$(GIT_TAG)" IMAGE_REGISTRY="$(IMAGE_REGISTRY)" HELM_CHART_REPO="$(HELM_CHART_REPO)" IMAGE_REPO="$(IMAGE_REPO)" HELM="$(HELM)" YQ="$(YQ)" ./hack/push-chart.sh
 
 ##@ Build Dependencies
@@ -361,3 +361,8 @@ YQ = $(PROJECT_DIR)/bin/yq
 .PHONY: yq
 yq: ## Download yq locally if necessary.
 	GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install github.com/mikefarah/yq/v4@v4.45.1
+
+crds: kustomize yq # update helm CRD files
+	$(KUSTOMIZE) build config/default \
+	| $(YQ) 'select(.kind == "CustomResourceDefinition")' \
+	> charts/lws/templates/crds/leaderworkerset.x-k8s.io_leaderworkersets.yaml

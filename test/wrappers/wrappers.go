@@ -55,7 +55,12 @@ func (lwsWrapper *LeaderWorkerSetWrapper) MaxSurge(value int) *LeaderWorkerSetWr
 }
 
 func (lwsWrapper *LeaderWorkerSetWrapper) Size(count int) *LeaderWorkerSetWrapper {
-	lwsWrapper.Spec.LeaderWorkerTemplate.Size = ptr.To[int32](int32(count))
+	lwsWrapper.Spec.LeaderWorkerTemplate.Size = ptr.To(int32(count))
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) LeaderTemplate(template *corev1.PodTemplateSpec) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.LeaderTemplate = template
 	return lwsWrapper
 }
 
@@ -80,6 +85,11 @@ func (lwsWrapper *LeaderWorkerSetWrapper) ExclusivePlacement() *LeaderWorkerSetW
 
 func (lwsWrapper *LeaderWorkerSetWrapper) RestartPolicy(policy leaderworkerset.RestartPolicyType) *LeaderWorkerSetWrapper {
 	lwsWrapper.Spec.LeaderWorkerTemplate.RestartPolicy = policy
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) ResizePolicy(policy leaderworkerset.ResizePolicyType) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.ResizePolicy = &policy
 	return lwsWrapper
 }
 
@@ -131,6 +141,11 @@ func (lwsWrapper *LeaderWorkerSetWrapper) SubdomainNil() *LeaderWorkerSetWrapper
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) Partition(partition int32) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition = &partition
+	return lwsWrapper
+}
+
 func BuildBasicLeaderWorkerSet(name, ns string) *LeaderWorkerSetWrapper {
 	return &LeaderWorkerSetWrapper{
 		leaderworkerset.LeaderWorkerSet{
@@ -160,6 +175,7 @@ func BuildLeaderWorkerSet(nsName string) *LeaderWorkerSetWrapper {
 	lws.Spec.RolloutStrategy = leaderworkerset.RolloutStrategy{
 		Type: leaderworkerset.RollingUpdateStrategyType,
 		RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
+			Partition:      ptr.To[int32](0),
 			MaxUnavailable: intstr.FromInt32(1),
 			MaxSurge:       intstr.FromInt(0),
 		},
@@ -169,6 +185,7 @@ func BuildLeaderWorkerSet(nsName string) *LeaderWorkerSetWrapper {
 	lws.Spec.NetworkConfig = &leaderworkerset.NetworkConfig{
 		SubdomainPolicy: &subdomainPolicy,
 	}
+	lws.Spec.LeaderWorkerTemplate.ResizePolicy = ptr.To(leaderworkerset.ResizePolicyNone)
 
 	return &LeaderWorkerSetWrapper{
 		lws,

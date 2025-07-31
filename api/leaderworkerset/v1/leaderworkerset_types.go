@@ -93,6 +93,13 @@ const (
 	SubdomainPolicyAnnotationKey string = "leaderworkerset.sigs.k8s.io/subdomainPolicy"
 )
 
+type ResizePolicyType string
+
+const (
+	ResizePolicyNone     ResizePolicyType = "None"
+	ResizePolicyRecreate ResizePolicyType = "Recreate"
+)
+
 // One group consists of a single leader and M workers, and the total number of pods in a group is M+1.
 // LeaderWorkerSet will create N replicas of leader-worker pod groups (hereinafter referred to as group).
 //
@@ -169,6 +176,14 @@ type LeaderWorkerTemplate struct {
 	// in each replica.
 	// +optional
 	SubGroupPolicy *SubGroupPolicy `json:"subGroupPolicy,omitempty"`
+
+	// ResizePolicy defines how to handle group size updates:
+	// - None: indicates the `spec.leaderWorkerTemplate.size` is immutable.
+	// - Recreate: indicates recreating the group Pods to reshape the size.
+	// +kubebuilder:default=None
+	// +kubebuilder:validation:Enum={None,Recreate}
+	// +optional
+	ResizePolicy *ResizePolicyType `json:"resizePolicy,omitempty"`
 }
 
 // RolloutStrategy defines the strategy that the leaderWorkerSet controller
@@ -248,6 +263,20 @@ const (
 
 // RollingUpdateConfiguration defines the parameters to be used for RollingUpdateStrategyType.
 type RollingUpdateConfiguration struct {
+	// Partition indicates the ordinal at which the lws should be partitioned for updates.
+	// During a rolling update, all the groups from ordinal Partition to Replicas-1 will be updated.
+	// The groups from 0 to Partition-1 will not be updated.
+	// This is helpful in incremental rollout strategies like canary deployments
+	// or interactive rollout strategies for multiple replicas like xPyD deployments.
+	// Once partition field and maxSurge field both set, the bursted replicas will keep remaining
+	// until the rolling update is completely done and the partition field is reset to 0.
+	// This is as expected to reduce the reconciling complexity.
+	// The default value is 0.
+	//
+	// +optional
+	// +kubebuilder:default=0
+	Partition *int32 `json:"partition,omitempty"`
+
 	// The maximum number of replicas that can be unavailable during the update.
 	// Value can be an absolute number (ex: 5) or a percentage of total replicas at the start of update (ex: 10%).
 	// Absolute number is calculated from percentage by rounding down.
@@ -365,6 +394,10 @@ const (
 //+kubebuilder:subresource:status
 //+kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.hpaPodSelector
 //+kubebuilder:resource:shortName={lws}
+//+kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas",description="Number of ready replicas"
+//+kubebuilder:printcolumn:name="Desired",type="integer",JSONPath=".spec.replicas",description="Number of desired replicas"
+//+kubebuilder:printcolumn:name="Up-to-date",type="integer",JSONPath=".status.updatedReplicas",description="Number of up-to-date replicas"
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // LeaderWorkerSet is the Schema for the leaderworkersets API
 type LeaderWorkerSet struct {
