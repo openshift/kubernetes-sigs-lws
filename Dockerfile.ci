@@ -1,0 +1,46 @@
+ARG BUILDER_IMAGE=registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.24-openshift-4.20
+ARG BASE_IMAGE=registry.ci.openshift.org/ocp/4.20:base-rhel9
+
+# Build the manager binary
+FROM ${BUILDER_IMAGE} AS builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETPLATFORM
+
+WORKDIR /workspace
+COPY . .
+
+ENV GOEXPERIMENT=strictfipsruntime
+ENV GOFLAGS="-tags=strictfipsruntime -mod=vendor -a"
+
+RUN make -f Makefile-ocp.mk build-ocp GO_BUILD_ENV='CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH}'
+
+FROM --platform=$TARGETPLATFORM ${BASE_IMAGE}
+WORKDIR /
+COPY --from=builder /workspace/bin/manager .
+RUN mkdir /licenses
+COPY --from=builder /workspace/LICENSE /licenses/.
+USER 65532:65532
+
+LABEL com.redhat.component="Leader Worker Set"
+LABEL name="lws"
+LABEL release="0.7.0"
+LABEL version="0.7.0"
+LABEL url="https://github.com/openshift/kubernetes-sigs-lws"
+LABEL vendor="Red Hat, Inc."
+LABEL description="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
+                   It aims to address common deployment patterns of AI/ML inference workloads, \
+                   especially multi-host inference workloads where the LLM will be sharded \
+                   and run across multiple devices on multiple nodes."
+LABEL io.k8s.description="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
+                          It aims to address common deployment patterns of AI/ML inference workloads, \
+                          especially multi-host inference workloads where the LLM will be sharded \
+                          and run across multiple devices on multiple nodes."
+LABEL summary="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
+                          It aims to address common deployment patterns of AI/ML inference workloads, \
+                          especially multi-host inference workloads where the LLM will be sharded \
+                          and run across multiple devices on multiple nodes."
+LABEL io.k8s.display-name="Leader Worker Set"
+LABEL io.openshift.tags="openshift,operator,leaderworkerset,lws"
+
+ENTRYPOINT ["/manager"]
