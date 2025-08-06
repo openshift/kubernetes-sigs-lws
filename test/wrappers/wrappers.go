@@ -88,11 +88,6 @@ func (lwsWrapper *LeaderWorkerSetWrapper) RestartPolicy(policy leaderworkerset.R
 	return lwsWrapper
 }
 
-func (lwsWrapper *LeaderWorkerSetWrapper) ResizePolicy(policy leaderworkerset.ResizePolicyType) *LeaderWorkerSetWrapper {
-	lwsWrapper.Spec.LeaderWorkerTemplate.ResizePolicy = &policy
-	return lwsWrapper
-}
-
 func (lwsWrapper *LeaderWorkerSetWrapper) RolloutStrategy(strategy leaderworkerset.RolloutStrategy) *LeaderWorkerSetWrapper {
 	lwsWrapper.Spec.RolloutStrategy = strategy
 	return lwsWrapper
@@ -146,6 +141,14 @@ func (lwsWrapper *LeaderWorkerSetWrapper) Partition(partition int32) *LeaderWork
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) SchedulerName(schedulerName string) *LeaderWorkerSetWrapper {
+	if lwsWrapper.Spec.LeaderWorkerTemplate.LeaderTemplate != nil {
+		lwsWrapper.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.SchedulerName = schedulerName
+	}
+	lwsWrapper.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.SchedulerName = schedulerName
+	return lwsWrapper
+}
+
 func BuildBasicLeaderWorkerSet(name, ns string) *LeaderWorkerSetWrapper {
 	return &LeaderWorkerSetWrapper{
 		leaderworkerset.LeaderWorkerSet{
@@ -185,7 +188,6 @@ func BuildLeaderWorkerSet(nsName string) *LeaderWorkerSetWrapper {
 	lws.Spec.NetworkConfig = &leaderworkerset.NetworkConfig{
 		SubdomainPolicy: &subdomainPolicy,
 	}
-	lws.Spec.LeaderWorkerTemplate.ResizePolicy = ptr.To(leaderworkerset.ResizePolicyNone)
 
 	return &LeaderWorkerSetWrapper{
 		lws,
