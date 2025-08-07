@@ -26,6 +26,7 @@ LABEL com.redhat.component="Leader Worker Set"
 LABEL name="lws"
 LABEL release="0.7.0"
 LABEL version="0.7.0"
+LABEL maintainer="support@redhat.com"
 LABEL url="https://github.com/openshift/kubernetes-sigs-lws"
 LABEL vendor="Red Hat, Inc."
 LABEL description="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
