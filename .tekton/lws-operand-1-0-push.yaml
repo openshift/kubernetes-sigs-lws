@@ -11,7 +11,7 @@ metadata:
       event == "push" 
       && target_branch == "release-0.7.0" 
       && (
-      ".tekton/lws-1-0-push.yaml".pathChanged() 
+      ".tekton/lws-operand-1-0-push.yaml".pathChanged() 
       || "api/***".pathChanged() 
       || "client-go/***".pathChanged()
       || "cmd/***".pathChanged() 
@@ -26,10 +26,10 @@ metadata:
       )
   creationTimestamp:
   labels:
-    appstudio.openshift.io/application: lws-1-0
-    appstudio.openshift.io/component: lws-1-0
+    appstudio.openshift.io/application: lws-operator-1-0
+    appstudio.openshift.io/component: lws-operand-1-0
     pipelines.appstudio.openshift.io/type: build
-  name: lws-1-0-on-push
+  name: lws-operand-1-0-on-push
   namespace: jobset-lws-pipeline-tenant
 spec:
   params:
@@ -636,7 +636,7 @@ spec:
       - name: netrc
         optional: true
   taskRunTemplate:
-    serviceAccountName: build-pipeline-lws-1-0
+    serviceAccountName: build-pipeline-lws-operand-1-0
   workspaces:
     - name: git-auth
       secret:
