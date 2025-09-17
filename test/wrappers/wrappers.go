@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strconv"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -149,6 +150,16 @@ func (lwsWrapper *LeaderWorkerSetWrapper) SchedulerName(schedulerName string) *L
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) VolumeClaimTemplates(volumeClaimTemplates []corev1.PersistentVolumeClaim) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.VolumeClaimTemplates = volumeClaimTemplates
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) PersistentVolumeClaimRetentionPolicy(policy *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.PersistentVolumeClaimRetentionPolicy = policy
+	return lwsWrapper
+}
+
 func BuildBasicLeaderWorkerSet(name, ns string) *LeaderWorkerSetWrapper {
 	return &LeaderWorkerSetWrapper{
 		leaderworkerset.LeaderWorkerSet{
@@ -220,7 +231,7 @@ func MakeWorkerPodSpec() corev1.PodSpec {
 	return corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name:  "leader",
+				Name:  "worker",
 				Image: "nginxinc/nginx-unprivileged:1.27",
 				Ports: []corev1.ContainerPort{
 					{
@@ -301,7 +312,7 @@ func MakeLeaderPodSpec() corev1.PodSpec {
 	return corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name:  "worker",
+				Name:  "leader",
 				Image: "nginxinc/nginx-unprivileged:1.27",
 			},
 		},
