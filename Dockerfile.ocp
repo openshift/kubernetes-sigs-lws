@@ -23,7 +23,8 @@ COPY --from=builder /workspace/LICENSE /licenses/.
 USER 65532:65532
 
 LABEL com.redhat.component="Leader Worker Set"
-LABEL name="lws"
+LABEL cpe="cpe:/a:redhat:leader_worker_set:1.0::el9"
+LABEL name="leader-worker-set/lws-rhel9"
 LABEL release="0.7.0"
 LABEL version="0.7.0"
 LABEL url="https://github.com/openshift/kubernetes-sigs-lws"
