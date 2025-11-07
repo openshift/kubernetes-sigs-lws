@@ -36,7 +36,7 @@ LABEL description="LeaderWorkerSet: An API for deploying a group of pods as a un
 LABEL io.k8s.description="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
                           It aims to address common deployment patterns of AI/ML inference workloads, \
                           especially multi-host inference workloads where the LLM will be sharded \
-                          and run across multiple devices on multiple nodes."
+                          and run across multiple devices on multiple nodes. "
 LABEL summary="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
                           It aims to address common deployment patterns of AI/ML inference workloads, \
                           especially multi-host inference workloads where the LLM will be sharded \
