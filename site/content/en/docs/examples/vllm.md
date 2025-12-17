@@ -16,13 +16,13 @@ We use LeaderWorkerSet to deploy two vLLM model replicas. We have two flavors of
 
 In both examples, Ray uses the leader pod as the head node and the worker pods as the worker nodes. The leader pod runs the vLLM server, with a ClusterIP Service exposing the port.
 
-{{< tabpane >}}
+{{< tabpane persist=false >}}
 {{< tab header="GPU" lang="shell" >}}
-export HUGGING_FACE_HUB_TOKEN=<your-hf-token>
+export HF_TOKEN=<your-hf-token>
 curl https://raw.githubusercontent.com/kubernetes-sigs/lws/refs/heads/main/docs/examples/vllm/GPU/lws.yaml -s | envsubst | kubectl apply -f -
 {{< /tab >}}
 {{< tab header="TPU" lang="shell" >}}
-export HUGGING_FACE_HUB_TOKEN=<your-hf-token>
+export HF_TOKEN=<your-hf-token>
 curl https://raw.githubusercontent.com/kubernetes-sigs/lws/refs/heads/main/docs/examples/vllm/TPU/lws.yaml -s | envsubst | kubectl apply -f -
 {{< /tab >}}
 {{< /tabpane >}}

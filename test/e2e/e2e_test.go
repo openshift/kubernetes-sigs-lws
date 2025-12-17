@@ -89,7 +89,7 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 			}
 
 			for _, expectedAnnotation := range expectedAnnotations {
-				gomega.Expect(pod.Labels[expectedAnnotation]).To(gomega.Not(gomega.BeNil()))
+				gomega.Expect(pod.Annotations[expectedAnnotation]).To(gomega.Not(gomega.BeNil()))
 			}
 		}
 
@@ -203,7 +203,7 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 			}
 
 			for _, expectedAnnotation := range expectedAnnotations {
-				gomega.Expect(pod.Labels[expectedAnnotation]).To(gomega.Not(gomega.BeNil()))
+				gomega.Expect(pod.Annotations[expectedAnnotation]).To(gomega.Not(gomega.BeNil()))
 			}
 
 		}
@@ -260,7 +260,7 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		for _, p := range lwsPods.Items {
 			gomega.Expect(testing.CheckAnnotation(p, leaderworkerset.SizeAnnotationKey, strconv.Itoa(newSize))).To(gomega.Succeed())
 		}
-		gomega.Expect(len(lwsPods.Items) == newSize*replicas).To(gomega.BeTrue())
+		gomega.Expect(len(lwsPods.Items)).To(gomega.Equal(newSize * replicas))
 	})
 
 	ginkgo.It("When changing subdomainPolicy, adds correct env vars", func() {
@@ -309,7 +309,7 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		testing.ExpectValidServices(ctx, k8sClient, lws, 4)
 	})
 
-	ginkgo.It("Doesnt add env vars to containers when not using TPU", func() {
+	ginkgo.It("Doesn't add env vars to containers when not using TPU", func() {
 		leaderPodSpec := wrappers.MakeLeaderPodSpec()
 		workerPodSpec := wrappers.MakeWorkerPodSpec()
 		lws = wrappers.BuildLeaderWorkerSet(ns.Name).Replica(2).Size(2).LeaderTemplateSpec(leaderPodSpec).WorkerTemplateSpec(workerPodSpec).Obj()
@@ -476,6 +476,7 @@ func serviceAccountToken(serviceAccountName, namespace string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer os.Remove(tokenRequestFile)
 
 	var out string
 	verifyTokenCreation := func(g gomega.Gomega) {

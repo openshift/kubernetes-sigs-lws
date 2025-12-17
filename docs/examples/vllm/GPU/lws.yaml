@@ -14,10 +14,10 @@ spec:
       spec:
         containers:
           - name: vllm-leader
-            image: vllm/vllm-openai:latest
+            image: vllm/vllm-openai:v0.8.5
             env:
-              - name: HUGGING_FACE_HUB_TOKEN
-                value: $HUGGING_FACE_HUB_TOKEN
+              - name: HF_TOKEN
+                value: $HF_TOKEN
             command:
               - sh
               - -c
@@ -50,7 +50,7 @@ spec:
       spec:
         containers:
           - name: vllm-worker
-            image: vllm/vllm-openai:latest
+            image: vllm/vllm-openai:v0.8.5
             command:
               - sh
               - -c
@@ -64,8 +64,8 @@ spec:
                 ephemeral-storage: 800Gi
                 cpu: 125
             env:
-              - name: HUGGING_FACE_HUB_TOKEN
-                value: $HUGGING_FACE_HUB_TOKEN
+              - name: HF_TOKEN
+                value: $HF_TOKEN
             volumeMounts:
               - mountPath: /dev/shm
                 name: dshm   

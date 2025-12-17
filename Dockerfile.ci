@@ -1,5 +1,5 @@
-ARG BUILDER_IMAGE=registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.24-openshift-4.20
-ARG BASE_IMAGE=registry.ci.openshift.org/ocp/4.20:base-rhel9
+ARG BUILDER_IMAGE=registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.25-openshift-4.21
+ARG BASE_IMAGE=registry.ci.openshift.org/ocp/4.21:base-rhel9
 
 # Build the manager binary
 FROM ${BUILDER_IMAGE} AS builder
@@ -25,8 +25,8 @@ USER 65532:65532
 LABEL com.redhat.component="Leader Worker Set"
 LABEL cpe="cpe:/a:redhat:leader_worker_set:1.0::el9"
 LABEL name="leader-worker-set/lws-rhel9"
-LABEL release="0.7.0"
-LABEL version="0.7.0"
+LABEL release="0.8.0"
+LABEL version="0.8.0"
 LABEL url="https://github.com/openshift/kubernetes-sigs-lws"
 LABEL vendor="Red Hat, Inc."
 LABEL description="LeaderWorkerSet: An API for deploying a group of pods as a unit of replication. \
