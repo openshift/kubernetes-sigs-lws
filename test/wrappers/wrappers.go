@@ -84,6 +84,12 @@ func (lwsWrapper *LeaderWorkerSetWrapper) ExclusivePlacement() *LeaderWorkerSetW
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) RestartGroupAfterStart() *LeaderWorkerSetWrapper {
+	lwsWrapper.Annotations = map[string]string{}
+	lwsWrapper.Annotations[leaderworkerset.RecreateGroupAfterStart] = "enable"
+	return lwsWrapper
+}
+
 func (lwsWrapper *LeaderWorkerSetWrapper) RestartPolicy(policy leaderworkerset.RestartPolicyType) *LeaderWorkerSetWrapper {
 	lwsWrapper.Spec.LeaderWorkerTemplate.RestartPolicy = policy
 	return lwsWrapper
@@ -334,6 +340,12 @@ func MakeLeaderPodSpecWithTPUResource() corev1.PodSpec {
 		},
 		Subdomain: "default",
 	}
+}
+
+func MakeLeaderPodSpecWithTPUAndEnvVars(e ...corev1.EnvVar) corev1.PodSpec {
+	podSpec := MakeLeaderPodSpecWithTPUResource()
+	podSpec.Containers[0].Env = e
+	return podSpec
 }
 
 func MakeLeaderPodSpecWithTPUResourceMultipleContainers() corev1.PodSpec {
