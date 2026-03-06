@@ -57,7 +57,7 @@ func MustCreateLws(ctx context.Context, k8sClient client.Client, lws *leaderwork
 
 func CreateWorkerPodsForLeaderPod(ctx context.Context, leaderPod corev1.Pod, k8sClient client.Client, lws leaderworkerset.LeaderWorkerSet) {
 	gomega.Eventually(func() error {
-		for i := 1; i <= int(*lws.Spec.LeaderWorkerTemplate.Size); i++ {
+		for i := 1; i < int(*lws.Spec.LeaderWorkerTemplate.Size); i++ {
 			worker := corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      leaderPod.Name + "-" + strconv.Itoa(i),
@@ -91,7 +91,7 @@ func DeleteWorkerPods(ctx context.Context, k8sClient client.Client, lws *leaderw
 	var workers corev1.PodList
 	gomega.Eventually(func() bool {
 		gomega.Expect(k8sClient.List(ctx, &workers, client.InNamespace(lws.Namespace), &client.MatchingLabels{"worker.pod": "workers"})).To(gomega.Succeed())
-		return len(workers.Items) == int(*lws.Spec.LeaderWorkerTemplate.Size)
+		return len(workers.Items) == int(*lws.Spec.LeaderWorkerTemplate.Size)-1
 	}, Timeout, Interval).Should(gomega.Equal(true))
 	for i := range workers.Items {
 		gomega.Expect(k8sClient.Delete(ctx, &workers.Items[i])).To(gomega.Succeed())
@@ -360,6 +360,17 @@ func SetLeaderPodToReady(ctx context.Context, k8sClient client.Client, podName s
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
 
+func SetPodToRunning(ctx context.Context, k8sClient client.Client, podName string, lws *leaderworkerset.LeaderWorkerSet) {
+	gomega.Eventually(func() error {
+		var pod corev1.Pod
+		if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: lws.Namespace, Name: podName}, &pod); err != nil {
+			return err
+		}
+		pod.Status.Phase = corev1.PodRunning
+		return k8sClient.Status().Update(ctx, &pod)
+	}, Timeout, Interval).Should(gomega.Succeed())
+}
+
 func SetPodToPending(ctx context.Context, k8sClient client.Client, podName string, lws *leaderworkerset.LeaderWorkerSet) {
 	gomega.Eventually(func() error {
 		var pod corev1.Pod
@@ -430,15 +441,28 @@ func containerHasAllEnvVars(c corev1.Container, envVars []string) bool {
 }
 
 func hasAllEnvVarPopulated(pod corev1.Pod, envVars []string) bool {
+	isTPUCheck := false
+	for _, e := range envVars {
+		if e == acceleratorutils.TpuWorkerId || e == acceleratorutils.TpuWorkerHostNames {
+			isTPUCheck = true
+			break
+		}
+	}
+
 	var containers []corev1.Container
 	containers = append(containers, pod.Spec.Containers...)
 	containers = append(containers, pod.Spec.InitContainers...)
+	checked := false
 	for _, container := range containers {
+		if isTPUCheck && !acceleratorutils.ContainersRequestTPUs(container) {
+			continue
+		}
+		checked = true
 		if !containerHasAllEnvVars(container, envVars) {
 			return false
 		}
 	}
-	return true
+	return checked
 }
 
 func HasLWSEnvVarsPopulated(pod corev1.Pod) bool {
@@ -482,7 +506,15 @@ func HasTPUEnvVarsPopulated(pod corev1.Pod) bool {
 }
 
 func CheckTPUContainerHasCorrectEnvVars(pod corev1.Pod, envVal string) error {
+	tpuContainers := []corev1.Container{}
 	for _, container := range pod.Spec.Containers {
+		if acceleratorutils.ContainersRequestTPUs(container) {
+			tpuContainers = append(tpuContainers, container)
+		}
+	}
+	numTPUContainers := len(tpuContainers)
+
+	for i, container := range tpuContainers {
 		for _, env := range container.Env {
 			if env.Name == acceleratorutils.TpuWorkerHostNames {
 				if env.Value != envVal {
@@ -490,28 +522,32 @@ func CheckTPUContainerHasCorrectEnvVars(pod corev1.Pod, envVal string) error {
 				}
 			}
 			if env.Name == acceleratorutils.TpuWorkerId {
-				if subGroupSize, foundSubGroupSize := pod.Annotations[leaderworkerset.SubGroupSizeAnnotationKey]; foundSubGroupSize {
+				var expectedIndex int
+				if subGroupSizeStr, foundSubGroupSize := pod.Annotations[leaderworkerset.SubGroupSizeAnnotationKey]; foundSubGroupSize {
 					workerIndex, _ := strconv.Atoi(pod.Labels[leaderworkerset.WorkerIndexLabelKey])
-					subGroupSize, _ := strconv.Atoi(subGroupSize)
-					index := (workerIndex) % subGroupSize
+					subGroupSize, _ := strconv.Atoi(subGroupSizeStr)
+					podWorkerIndex := (workerIndex) % subGroupSize
 					if pod.Annotations[acceleratorutils.LeaderRequestsTPUsAnnotationKey] != "true" {
-						index = (workerIndex - 1) % subGroupSize
+						podWorkerIndex = (workerIndex - 1) % subGroupSize
 					}
-					if env.Value != fmt.Sprint(index) {
-						return fmt.Errorf("incorrect env value for %s", acceleratorutils.TpuWorkerId)
-					}
+					expectedIndex = podWorkerIndex*numTPUContainers + i
 				} else if pod.Labels[leaderworkerset.WorkerIndexLabelKey] == "0" ||
 					pod.Annotations[acceleratorutils.LeaderRequestsTPUsAnnotationKey] == "true" {
-					if env.Value != pod.Labels[leaderworkerset.WorkerIndexLabelKey] {
-						return fmt.Errorf("incorrect env value for %s", acceleratorutils.TpuWorkerId)
-					}
+					podWorkerIndex, _ := strconv.Atoi(pod.Labels[leaderworkerset.WorkerIndexLabelKey])
+					expectedIndex = podWorkerIndex*numTPUContainers + i
 				} else {
-					index, _ := strconv.Atoi(pod.Labels[leaderworkerset.WorkerIndexLabelKey])
-					if env.Value != fmt.Sprint(index-1) {
-						return fmt.Errorf("incorrect env value for %s", acceleratorutils.TpuWorkerId)
-					}
+					podWorkerIndex, _ := strconv.Atoi(pod.Labels[leaderworkerset.WorkerIndexLabelKey])
+					expectedIndex = (podWorkerIndex-1)*numTPUContainers + i
 				}
-
+				if env.Value != fmt.Sprint(expectedIndex) {
+					return fmt.Errorf("incorrect env value for %s, expect %d, got %s", acceleratorutils.TpuWorkerId, expectedIndex, env.Value)
+				}
+			}
+			if env.Name == acceleratorutils.TpuProcessPortName {
+				expectedPort := strconv.Itoa(8476 + i)
+				if env.Value != expectedPort {
+					return fmt.Errorf("incorrect env value for %s, expect %s, got %s", acceleratorutils.TpuProcessPortName, expectedPort, env.Value)
+				}
 			}
 		}
 	}

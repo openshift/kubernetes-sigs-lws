@@ -195,7 +195,7 @@ func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.
 	if err := controllers.NewLeaderWorkerSetReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
-		mgr.GetEventRecorderFor("leaderworkerset"),
+		mgr.GetEventRecorder("leaderworkerset"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LeaderWorkerSet")
 		os.Exit(1)
@@ -212,7 +212,7 @@ func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.
 		setupLog.Info("Gang scheduling enabled", "provider", *cfg.GangSchedulingManagement.SchedulerProvider)
 	}
 	// Set up pod reconciler.
-	podController := controllers.NewPodReconciler(mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorderFor("leaderworkerset"), sp)
+	podController := controllers.NewPodReconciler(mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorder("leaderworkerset"), sp)
 	if err := podController.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Pod")
 		os.Exit(1)

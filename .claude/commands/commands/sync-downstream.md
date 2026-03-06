@@ -21,6 +21,7 @@ The following OpenShift-specific files/directories should be carried over from d
 - `.ci-operator.yaml` - OpenShift CI operator configuration
 - `.snyk` - Snyk security scanning configuration
 - `.tekton/` - Tekton pipeline definitions (entire directory)
+- `.claude/` - Claude Code skills and commands (entire directory)
 - `Dockerfile.ocp` - OpenShift-specific Dockerfile
 - `Dockerfile.ci` - CI-specific Dockerfile
 - `Makefile-ocp.mk` - OpenShift-specific Makefile
@@ -49,6 +50,7 @@ Now perform the downstream sync workflow step by step:
     - Try `git checkout downstream/main -- .ci-operator.yaml` (if error, skip and note)
     - Try `git checkout downstream/main -- .snyk` (if error, skip and note)
     - Try `git checkout downstream/main -- .tekton/` (if error, skip and note)
+    - Try `git checkout downstream/main -- .claude/` (if error, skip and note)
     - Try `git checkout downstream/main -- Dockerfile.ocp` (if error, skip and note)
     - Try `git checkout downstream/main -- Dockerfile.ci` (if error, skip and note)
     - Try `git checkout downstream/main -- Makefile-ocp.mk` (if error, skip and note)

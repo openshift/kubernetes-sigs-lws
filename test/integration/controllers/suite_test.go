@@ -104,14 +104,14 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).ToNot(HaveOccurred())
 
-	lwsController := controllers.NewLeaderWorkerSetReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorderFor("leaderworkerset"))
+	lwsController := controllers.NewLeaderWorkerSetReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("leaderworkerset"))
 
 	err = controllers.SetupIndexes(k8sManager.GetFieldIndexer())
 	Expect(err).ToNot(HaveOccurred())
 	err = lwsController.SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
-	podController = controllers.NewPodReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorderFor("pod"), nil)
+	podController = controllers.NewPodReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("pod"), nil)
 	err = podController.SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 

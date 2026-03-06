@@ -85,8 +85,15 @@ func (lwsWrapper *LeaderWorkerSetWrapper) ExclusivePlacement() *LeaderWorkerSetW
 }
 
 func (lwsWrapper *LeaderWorkerSetWrapper) RestartGroupAfterStart() *LeaderWorkerSetWrapper {
-	lwsWrapper.Annotations = map[string]string{}
-	lwsWrapper.Annotations[leaderworkerset.RecreateGroupAfterStart] = "enable"
+	lwsWrapper.Spec.LeaderWorkerTemplate.RestartPolicy = leaderworkerset.RecreateGroupAfterStart
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) RestartGroupAfterStartAnnotation() *LeaderWorkerSetWrapper {
+	if lwsWrapper.Annotations == nil {
+		lwsWrapper.Annotations = map[string]string{}
+	}
+	lwsWrapper.Annotations[leaderworkerset.RecreateGroupAfterStartAnnotationKey] = "enable"
 	return lwsWrapper
 }
 
@@ -328,15 +335,7 @@ func MakeLeaderPodSpec() corev1.PodSpec {
 func MakeLeaderPodSpecWithTPUResource() corev1.PodSpec {
 	return corev1.PodSpec{
 		Containers: []corev1.Container{
-			{
-				Name:  "worker",
-				Image: "busybox",
-				Resources: corev1.ResourceRequirements{
-					Limits: map[corev1.ResourceName]resource.Quantity{
-						corev1.ResourceName("google.com/tpu"): resource.MustParse("4"),
-					},
-				},
-			},
+			MakeContainerWithTPU("worker"),
 		},
 		Subdomain: "default",
 	}
@@ -348,18 +347,28 @@ func MakeLeaderPodSpecWithTPUAndEnvVars(e ...corev1.EnvVar) corev1.PodSpec {
 	return podSpec
 }
 
+func MakeContainerWithTPU(name string) corev1.Container {
+	return corev1.Container{
+		Name:  name,
+		Image: "busybox",
+		Resources: corev1.ResourceRequirements{
+			Limits: map[corev1.ResourceName]resource.Quantity{
+				corev1.ResourceName("google.com/tpu"): resource.MustParse("4"),
+			},
+		},
+	}
+}
+
+func MakeContainerWithTPUAndEnvVars(name string, e ...corev1.EnvVar) corev1.Container {
+	c := MakeContainerWithTPU(name)
+	c.Env = e
+	return c
+}
+
 func MakeLeaderPodSpecWithTPUResourceMultipleContainers() corev1.PodSpec {
 	return corev1.PodSpec{
 		Containers: []corev1.Container{
-			{
-				Name:  "worker",
-				Image: "busybox",
-				Resources: corev1.ResourceRequirements{
-					Limits: map[corev1.ResourceName]resource.Quantity{
-						corev1.ResourceName("google.com/tpu"): resource.MustParse("4"),
-					},
-				},
-			},
+			MakeContainerWithTPU("worker"),
 			{
 				Name:  "leader",
 				Image: "docker.io/nginxinc/nginx-unprivileged:1.27",
@@ -419,5 +428,15 @@ func MakeWorkerPodSpecWithVolumeAndNilImage() corev1.PodSpec {
 				},
 			},
 		},
+	}
+}
+
+func MakeLeaderPodSpecWithTwoTPUContainers() corev1.PodSpec {
+	return corev1.PodSpec{
+		Containers: []corev1.Container{
+			MakeContainerWithTPU("worker-1"),
+			MakeContainerWithTPU("worker-2"),
+		},
+		Subdomain: "default",
 	}
 }
