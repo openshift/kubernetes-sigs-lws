@@ -1,16 +1,11 @@
-# See the OWNERS docs at https://go.k8s.io/owners
-
-approvers:
-  - ahg-g
-  - kerthcet
-  - edwinhr716
-
 reviewers:
-  - ahg-g
   - ardaguclu
-  - kerthcet
-  - edwinhr716
-  - yankay
-
-emeritus_approvers:
-  - liurupeng 
+  - atiratree
+  - kannon92
+  - mrunalp
+approvers:
+  - ardaguclu
+  - atiratree
+  - kannon92
+  - mrunalp
+component: "kubernetes-sigs-lws"

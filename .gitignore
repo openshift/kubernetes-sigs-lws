@@ -19,14 +19,10 @@ artifacts
 # editor and IDE paraphernalia
 .idea
 .vscode
-*.code-workspace
 *.nix
 *.swp
 *.swo
 *~
-
-# vendor files
-vendor
 
 # Local Netlify folder
 .netlify
