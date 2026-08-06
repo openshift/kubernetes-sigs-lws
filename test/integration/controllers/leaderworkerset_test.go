@@ -534,28 +534,53 @@ var _ = ginkgo.Describe("LeaderWorkerSet controller", func() {
 						lwsUpdateFn: func(lws *leaderworkerset.LeaderWorkerSet) {
 							var leaderPod corev1.Pod
 							gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name + "-0", Namespace: lws.Namespace}, &leaderPod)).To(gomega.Succeed())
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Leader pod retrieved: %s, Phase: %s\n", leaderPod.Name, leaderPod.Status.Phase)
 							testing.CreateWorkerPodsForLeaderPod(ctx, leaderPod, k8sClient, *lws)
 							var workers corev1.PodList
 							gomega.Eventually(func() int {
 								gomega.Expect(k8sClient.List(ctx, &workers, client.InNamespace(lws.Namespace), &client.MatchingLabels{"worker.pod": "workers"})).To(gomega.Succeed())
 								return len(workers.Items)
 							}, testing.Timeout, testing.Interval).Should(gomega.Equal(3))
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Found %d worker pods\n", len(workers.Items))
 							// set all Pods status to running
 							testing.SetPodToRunning(ctx, k8sClient, leaderPod.Name, lws)
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Set leader pod %s to running\n", leaderPod.Name)
 							for _, worker := range workers.Items {
 								testing.SetPodToRunning(ctx, k8sClient, worker.Name, lws)
+								fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Set worker pod %s to running\n", worker.Name)
 							}
 							deletedPodName = workers.Items[0].Name
 							// delete one worker pod
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: About to delete worker pod: %s\n", deletedPodName)
 							gomega.Expect(k8sClient.Delete(ctx, &workers.Items[0])).To(gomega.Succeed())
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Successfully deleted worker pod: %s\n", deletedPodName)
 						},
 						checkLWSState: func(lws *leaderworkerset.LeaderWorkerSet) {
 							var leaderPod corev1.Pod
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Checking if leader pod should be deleted. Expected deleted worker pod: %s\n", deletedPodName)
+
+							// List all pods to see what exists
+							var allPods corev1.PodList
+							gomega.Expect(k8sClient.List(ctx, &allPods, client.InNamespace(lws.Namespace))).To(gomega.Succeed())
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: All pods in namespace:\n")
+							for _, pod := range allPods.Items {
+								fmt.Fprintf(ginkgo.GinkgoWriter, "  - %s: Phase=%s, DeletionTimestamp=%v\n",
+									pod.Name, pod.Status.Phase, pod.DeletionTimestamp)
+							}
+
 							gomega.Eventually(func() bool {
 								gomega.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lws.Name + "-0", Namespace: lws.Namespace}, &leaderPod)).To(gomega.Succeed())
+								if leaderPod.DeletionTimestamp == nil {
+									fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Leader pod %s DeletionTimestamp is nil. Pod status: %+v, Phase: %s\n",
+										leaderPod.Name, leaderPod.Status, leaderPod.Status.Phase)
+								} else {
+									fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Leader pod %s has DeletionTimestamp: %v\n",
+										leaderPod.Name, leaderPod.DeletionTimestamp)
+								}
 								return leaderPod.DeletionTimestamp != nil
 							}, testing.Timeout, testing.Interval).Should(gomega.BeTrue())
 							expectedMessage := fmt.Sprintf("Worker pod %s failed, deleted leader pod %s to recreate group 0", deletedPodName, lws.Name+"-0")
+							fmt.Fprintf(ginkgo.GinkgoWriter, "DEBUG: Validating event with expected message: %s\n", expectedMessage)
 							testing.ValidateEvent(ctx, k8sClient, "RecreateGroup", corev1.EventTypeNormal, expectedMessage, lws.Namespace)
 						},
 					}
