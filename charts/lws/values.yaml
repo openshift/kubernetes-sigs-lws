@@ -6,6 +6,10 @@ nameOverride: ""
 fullnameOverride: ""
 enablePrometheus: false
 enableCertManager: false
+# enableDisaggregatedSet installs the DisaggregatedSet editor/viewer/admin
+# ClusterRoles and the validating webhook. The CRD (under crds/), the
+# bundled controller, and its manager RBAC are always installed.
+enableDisaggregatedSet: false
 replicaCount: 1
 imagePullSecrets: []
 # Customize controlerManager
@@ -45,6 +49,7 @@ resources:
     # requests:
     #   cpu: 100m
     #   memory: 128Mi
+priorityClassName: ""
 nodeSelector: {}
 tolerations: []
 affinity: {}

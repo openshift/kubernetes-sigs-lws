@@ -35,6 +35,7 @@ import (
 	metaapplyv1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/lru"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +55,8 @@ type LeaderWorkerSetReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Record events.EventRecorder
+
+	revisionEqualityCache *lru.Cache
 }
 
 var (
@@ -72,6 +75,7 @@ const (
 	GroupsProgressing = "GroupsProgressing"
 	GroupsUpdating    = "GroupsUpdating"
 	CreatingRevision  = "CreatingRevision"
+	FailedUpdate      = "FailedUpdate"
 
 	// Event actions
 	Create = "Create"
@@ -79,11 +83,15 @@ const (
 	Delete = "Delete"
 )
 
+// maxRevisionEqualityCacheEntries is the cache size for semantic revision equality results.
+const maxRevisionEqualityCacheEntries = 10_000
+
 func NewLeaderWorkerSetReconciler(client client.Client, scheme *runtime.Scheme, record events.EventRecorder) *LeaderWorkerSetReconciler {
 	return &LeaderWorkerSetReconciler{
-		Client: client,
-		Scheme: scheme,
-		Record: record,
+		Client:                client,
+		Scheme:                scheme,
+		Record:                record,
+		revisionEqualityCache: lru.New(maxRevisionEqualityCacheEntries),
 	}
 }
 
@@ -156,7 +164,9 @@ func (r *LeaderWorkerSetReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	if err := r.SSAWithStatefulset(ctx, lws, partition, replicas, revisionutils.GetRevisionKey(revision)); err != nil {
 		if leaderSts == nil {
-			r.Record.Eventf(lws, nil, corev1.EventTypeWarning, FailedCreate, Create, fmt.Sprintf("Failed to create leader statefulset %s", lws.Name))
+			r.Record.Eventf(lws, nil, corev1.EventTypeWarning, FailedCreate, Create, fmt.Sprintf("Failed to create leader statefulset %s: %v", lws.Name, err))
+		} else {
+			r.Record.Eventf(lws, nil, corev1.EventTypeWarning, FailedUpdate, Update, fmt.Sprintf("Failed to update leader statefulset %s: %v", lws.Name, err))
 		}
 		return ctrl.Result{}, err
 	}
@@ -166,7 +176,14 @@ func (r *LeaderWorkerSetReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		r.Record.Eventf(lws, revision, corev1.EventTypeNormal, GroupsProgressing, Create, fmt.Sprintf("Created leader statefulset %s", lws.Name))
 	} else if !lwsUpdated && partition != *leaderSts.Spec.UpdateStrategy.RollingUpdate.Partition {
 		// An event is logged to track update progress.
-		r.Record.Eventf(lws, revision, corev1.EventTypeNormal, GroupsUpdating, Update, fmt.Sprintf("Updating replicas %d to %d", *leaderSts.Spec.UpdateStrategy.RollingUpdate.Partition, partition))
+		oldPartition := *leaderSts.Spec.UpdateStrategy.RollingUpdate.Partition
+		var updateMsg string
+		if oldPartition-1 == partition {
+			updateMsg = fmt.Sprintf("Updating replica %d", partition)
+		} else {
+			updateMsg = fmt.Sprintf("Updating replicas %d to %d (inclusive)", partition, oldPartition-1)
+		}
+		r.Record.Eventf(lws, revision, corev1.EventTypeNormal, GroupsUpdating, Update, updateMsg)
 	}
 
 	// Create headless service if it does not exist.
@@ -210,15 +227,21 @@ func (r *LeaderWorkerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Watches(&appsv1.StatefulSet{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
-				return []reconcile.Request{
-					{NamespacedName: types.NamespacedName{
-						Name:      a.GetLabels()[leaderworkerset.SetNameLabelKey],
-						Namespace: a.GetNamespace(),
-					}},
-				}
-			})).
+			handler.EnqueueRequestsFromMapFunc(enqueueLWSRequests)).
 		Complete(r)
+}
+
+func enqueueLWSRequests(ctx context.Context, a client.Object) []reconcile.Request {
+	name := a.GetLabels()[leaderworkerset.SetNameLabelKey]
+	if name == "" {
+		return nil
+	}
+	return []reconcile.Request{
+		{NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: a.GetNamespace(),
+		}},
+	}
 }
 
 func SetupIndexes(indexer client.FieldIndexer) error {
@@ -282,6 +305,10 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 	if err != nil {
 		return 0, 0, err
 	}
+	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&lws.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable, int(lwsReplicas), false)
+	if err != nil {
+		return 0, 0, err
+	}
 	// No need to burst more than the replicas.
 	if maxSurge > int(lwsReplicas) {
 		maxSurge = int(lwsReplicas)
@@ -290,22 +317,24 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 
 	// wantReplicas calculates the final replicas if needed.
 	wantReplicas := func(unreadyReplicas int32) int32 {
-		if unreadyReplicas <= int32(maxSurge) {
-			// When we have n unready replicas and n bursted replicas, we should
-			// start to release the burst replica gradually for the accommodation of
-			// the unready ones.
-			finalReplicas := lwsReplicas + utils.NonZeroValue(int32(unreadyReplicas)-1)
+		finalReplicas := calculateRollingUpdateReplicas(lwsReplicas, int32(maxSurge), int32(maxUnavailable), unreadyReplicas)
+		if finalReplicas == stsReplicas-1 {
 			r.Record.Eventf(lws, nil, corev1.EventTypeNormal, GroupsProgressing, Delete, fmt.Sprintf("deleting surge replica %s-%d", lws.Name, finalReplicas))
-			return finalReplicas
+		} else if finalReplicas < stsReplicas {
+			r.Record.Eventf(lws, nil, corev1.EventTypeNormal, GroupsProgressing, Delete, fmt.Sprintf("deleting surge replicas from %s-%d to %s-%d", lws.Name, finalReplicas, lws.Name, stsReplicas-1))
 		}
-		return burstReplicas
+		return finalReplicas
 	}
 
 	// Case 2:
 	// Indicates a new rolling update here.
 	if leaderWorkerSetUpdated {
 		// Processing scaling up/down first prior to rolling update.
-		return min(lwsReplicas, stsReplicas), wantReplicas(lwsReplicas), nil
+		partition := min(lwsReplicas, stsReplicas)
+		if stsReplicas < lwsReplicas {
+			return partition, lwsReplicas, nil
+		}
+		return partition, wantReplicas(lwsReplicas), nil
 	}
 
 	partition := *sts.Spec.UpdateStrategy.RollingUpdate.Partition
@@ -314,6 +343,9 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 	// In normal cases, return the values directly.
 	if rollingUpdateCompleted {
 		return 0, lwsReplicas, nil
+	}
+	if stsReplicas < lwsReplicas {
+		return partition, lwsReplicas, nil
 	}
 
 	states, err := r.getReplicaStates(ctx, lws, stsReplicas, revisionKey)
@@ -330,21 +362,20 @@ func (r *LeaderWorkerSetReconciler) rollingUpdateParameters(ctx context.Context,
 	// Case 4:
 	// Replicas changed during rolling update.
 	if replicasUpdated {
-		return min(partition, burstReplicas), wantReplicas(lwsUnreadyReplicas), nil
+		partition := min(partition, burstReplicas)
+		return partition, wantReplicas(lwsUnreadyReplicas), nil
 	}
 
 	// Case 5:
 	// Calculating the Partition during rolling update, no leaderWorkerSet updates happens.
 
-	rollingStep, err := intstr.GetScaledValueFromIntOrPercent(&lws.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable, int(lwsReplicas), false)
-	if err != nil {
-		return 0, 0, err
-	}
+	rollingStep := maxUnavailable
 	// Make sure that we always respect the maxUnavailable, or
 	// we'll violate it when reclaiming bursted replicas.
 	rollingStep += maxSurge - (int(burstReplicas) - int(stsReplicas))
 
-	return rollingUpdatePartition(states, stsReplicas, int32(rollingStep), partition), wantReplicas(lwsUnreadyReplicas), nil
+	partition = rollingUpdatePartition(states, stsReplicas, int32(rollingStep), partition)
+	return partition, wantReplicas(lwsUnreadyReplicas), nil
 }
 
 func (r *LeaderWorkerSetReconciler) SSAWithStatefulset(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, partition, replicas int32, revisionKey string) error {
@@ -464,12 +495,12 @@ func (r *LeaderWorkerSetReconciler) updateConditions(ctx context.Context, lws *l
 	if partitionedUpdatedNonBurstCount < partitionedCurrentNonBurstCount {
 		// upgradeInProgress is true when the upgrade replicas is smaller than the expected
 		// number of total replicas not including the burst replicas
-		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetUpdateInProgress))
-		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing))
+		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetUpdateInProgress, lws))
+		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing, lws))
 	} else if readyNonBurstWorkerCount == int(*lws.Spec.Replicas) && partitionedUpdatedAndReadyCount == partitionedCurrentNonBurstCount {
-		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetAvailable))
+		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetAvailable, lws))
 	} else {
-		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing))
+		conditions = append(conditions, makeCondition(leaderworkerset.LeaderWorkerSetProgressing, lws))
 	}
 
 	// updateDone is true when all replicas are updated and ready
@@ -499,6 +530,11 @@ func (r *LeaderWorkerSetReconciler) updateStatus(ctx context.Context, lws *leade
 	replicas := int(sts.Status.Replicas)
 	if lws.Status.Replicas != int32(replicas) {
 		lws.Status.Replicas = int32(replicas)
+		updateStatus = true
+	}
+
+	if lws.Status.ObservedGeneration != lws.Generation {
+		lws.Status.ObservedGeneration = lws.Generation
 		updateStatus = true
 	}
 
@@ -652,6 +688,19 @@ func calculateLWSUnreadyReplicas(states []replicaState, lwsReplicas int32) int32
 	return unreadyCount
 }
 
+func calculateRollingUpdateReplicas(lwsReplicas int32, maxSurge int32, maxUnavailable int32, unreadyReplicas int32) int32 {
+	burstReplicas := lwsReplicas + maxSurge
+	if unreadyReplicas <= maxSurge {
+		// Keep enough surge replicas to cover any desired replicas that are still
+		// unavailable beyond the configured maxUnavailable budget. Once the
+		// remaining unready desired replicas fit inside the budget, we can reclaim
+		// surge capacity gradually.
+		requiredSurgeReplicas := utils.NonZeroValue(unreadyReplicas - maxUnavailable)
+		return lwsReplicas + requiredSurgeReplicas
+	}
+	return burstReplicas
+}
+
 func calculateContinuousReadyReplicas(states []replicaState) int32 {
 	// Count ready replicas at tail (from last index down)
 	var continuousReadyCount int32
@@ -712,6 +761,10 @@ func (r *LeaderWorkerSetReconciler) getUpdatedRevision(ctx context.Context, sts 
 	}
 
 	if !revisionutils.EqualRevision(currentRevision, revision) {
+		// If raw bytes differ but the revision is semantically equivalent, avoid triggering a spurious rolling update.
+		if revisionutils.SetMatchesRevision(lws, currentRevision, revision, r.revisionEqualityCache) {
+			return nil, nil
+		}
 		return currentRevision, nil
 	}
 
@@ -761,7 +814,35 @@ func constructLeaderStatefulSetApplyConfiguration(lws *leaderworkerset.LeaderWor
 
 	podTemplateApplyConfiguration.WithAnnotations(podAnnotations)
 
+	lwsReplicas := int(*lws.Spec.Replicas)
+	lwsMaxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&lws.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable, lwsReplicas, false)
+	if err != nil {
+		return nil, err
+	}
+	lwsMaxSurge, err := intstr.GetScaledValueFromIntOrPercent(&lws.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxSurge, lwsReplicas, true)
+	if err != nil {
+		return nil, err
+	}
+	if lwsMaxSurge > lwsReplicas {
+		lwsMaxSurge = lwsReplicas
+	}
+	stsMaxUnavailableInt := int32(lwsMaxUnavailable + lwsMaxSurge)
+	// lwsMaxUnavailable=0 and lwsMaxSurge=0 together should be blocked by webhook,
+	// but just in case, we'll make sure that stsMaxUnavailable is at least 1.
+	// This also handles the case when lws.Spec.Replicas is 0.
+	if stsMaxUnavailableInt < 1 {
+		stsMaxUnavailableInt = 1
+	}
+	stsMaxUnavailable := intstr.FromInt32(stsMaxUnavailableInt)
+
 	// construct statefulset apply configuration
+	statefulSetLabels := mergeMetadata(lws.Labels, map[string]string{
+		leaderworkerset.SetNameLabelKey: lws.Name,
+		leaderworkerset.RevisionKey:     revisionKey,
+	})
+	statefulSetAnnotations := mergeMetadata(lws.Annotations, map[string]string{
+		leaderworkerset.ReplicasAnnotationKey: strconv.Itoa(int(*lws.Spec.Replicas)),
+	})
 	statefulSetConfig := appsapplyv1.StatefulSet(lws.Name, lws.Namespace).
 		WithSpec(appsapplyv1.StatefulSetSpec().
 			WithServiceName(lws.Name).
@@ -769,20 +850,15 @@ func constructLeaderStatefulSetApplyConfiguration(lws *leaderworkerset.LeaderWor
 			WithPodManagementPolicy(appsv1.ParallelPodManagement).
 			WithTemplate(&podTemplateApplyConfiguration).
 			WithUpdateStrategy(appsapplyv1.StatefulSetUpdateStrategy().WithType(appsv1.StatefulSetUpdateStrategyType(lws.Spec.RolloutStrategy.Type)).WithRollingUpdate(
-				appsapplyv1.RollingUpdateStatefulSetStrategy().WithMaxUnavailable(lws.Spec.RolloutStrategy.RollingUpdateConfiguration.MaxUnavailable).WithPartition(partition),
+				appsapplyv1.RollingUpdateStatefulSetStrategy().WithMaxUnavailable(stsMaxUnavailable).WithPartition(partition),
 			)).
 			WithSelector(metaapplyv1.LabelSelector().
 				WithMatchLabels(map[string]string{
 					leaderworkerset.SetNameLabelKey:     lws.Name,
 					leaderworkerset.WorkerIndexLabelKey: "0",
 				}))).
-		WithLabels(map[string]string{
-			leaderworkerset.SetNameLabelKey: lws.Name,
-			leaderworkerset.RevisionKey:     revisionKey,
-		}).
-		WithAnnotations(map[string]string{
-			leaderworkerset.ReplicasAnnotationKey: strconv.Itoa(int(*lws.Spec.Replicas)),
-		})
+		WithLabels(statefulSetLabels).
+		WithAnnotations(statefulSetAnnotations)
 
 	pvcApplyConfiguration := controllerutils.GetPVCApplyConfiguration(lws)
 	if len(pvcApplyConfiguration) > 0 {
@@ -799,7 +875,7 @@ func constructLeaderStatefulSetApplyConfiguration(lws *leaderworkerset.LeaderWor
 	return statefulSetConfig, nil
 }
 
-func makeCondition(conditionType leaderworkerset.LeaderWorkerSetConditionType) metav1.Condition {
+func makeCondition(conditionType leaderworkerset.LeaderWorkerSetConditionType, lws *leaderworkerset.LeaderWorkerSet) metav1.Condition {
 	var condtype, reason, message string
 	switch conditionType {
 	case leaderworkerset.LeaderWorkerSetAvailable:
@@ -820,6 +896,7 @@ func makeCondition(conditionType leaderworkerset.LeaderWorkerSetConditionType) m
 		Type:               condtype,
 		Status:             metav1.ConditionStatus(corev1.ConditionTrue),
 		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: lws.Generation,
 		Reason:             reason,
 		Message:            message,
 	}
@@ -830,6 +907,13 @@ func setConditions(lws *leaderworkerset.LeaderWorkerSet, conditions []metav1.Con
 	shouldUpdate := false
 	for _, condition := range conditions {
 		shouldUpdate = shouldUpdate || setCondition(lws, condition)
+	}
+
+	for i := range lws.Status.Conditions {
+		if lws.Status.Conditions[i].ObservedGeneration != lws.Generation {
+			lws.Status.Conditions[i].ObservedGeneration = lws.Generation
+			shouldUpdate = true
+		}
 	}
 
 	return shouldUpdate
@@ -843,7 +927,8 @@ func setCondition(lws *leaderworkerset.LeaderWorkerSet, newCondition metav1.Cond
 	// Precondition: newCondition has status true.
 	for i, curCondition := range lws.Status.Conditions {
 		if newCondition.Type == curCondition.Type {
-			if newCondition.Status != curCondition.Status {
+			if newCondition.Status != curCondition.Status ||
+				newCondition.ObservedGeneration != curCondition.ObservedGeneration {
 				// the conditions match but one is true and one is false. Update the stored condition
 				// with the new condition.
 				lws.Status.Conditions[i] = newCondition
@@ -856,8 +941,9 @@ func setCondition(lws *leaderworkerset.LeaderWorkerSet, newCondition metav1.Cond
 			// Available and both are true. Must be mutually exclusive.
 			if exclusiveConditionTypes(curCondition, newCondition) &&
 				(newCondition.Status == metav1.ConditionTrue) && (curCondition.Status == metav1.ConditionTrue) {
-				// Progressing is true and Available is true. Prevent this.
 				lws.Status.Conditions[i].Status = metav1.ConditionFalse
+				lws.Status.Conditions[i].LastTransitionTime = metav1.Now()
+				lws.Status.Conditions[i].ObservedGeneration = newCondition.ObservedGeneration
 				shouldUpdate = true
 			}
 		}

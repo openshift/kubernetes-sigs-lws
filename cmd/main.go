@@ -38,15 +38,18 @@ import (
 	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	configapi "sigs.k8s.io/lws/api/config/v1alpha1"
+	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/cert"
 	"sigs.k8s.io/lws/pkg/config"
 	"sigs.k8s.io/lws/pkg/controllers"
+	disaggregatedsetcontroller "sigs.k8s.io/lws/pkg/controllers/disaggregatedset"
 	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	"sigs.k8s.io/lws/pkg/utils"
 	"sigs.k8s.io/lws/pkg/utils/useragent"
 	"sigs.k8s.io/lws/pkg/version"
 	"sigs.k8s.io/lws/pkg/webhooks"
+	disaggregatedsetwebhook "sigs.k8s.io/lws/pkg/webhooks/disaggregatedset"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -60,6 +63,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(leaderworkersetv1.AddToScheme(scheme))
+	utilruntime.Must(disaggregatedsetv1.AddToScheme(scheme))
 	utilruntime.Must(configapi.AddToScheme(scheme))
 	utilruntime.Must(volcanov1beta1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
@@ -200,6 +204,15 @@ func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.
 		setupLog.Error(err, "unable to create controller", "controller", "LeaderWorkerSet")
 		os.Exit(1)
 	}
+	// Set up DisaggregatedSet controller
+	if err := (&disaggregatedsetcontroller.DisaggregatedSetReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Record: mgr.GetEventRecorder("disaggregatedset"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DisaggregatedSet")
+		os.Exit(1)
+	}
 	// Set up scheduler provider
 	var sp schedulerprovider.SchedulerProvider
 	if cfg.GangSchedulingManagement != nil {
@@ -226,6 +239,10 @@ func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.
 		pw := webhooks.NewPodWebhook(sp)
 		if err := pw.Setup(mgr); err != nil {
 			setupLog.Error(err, "unable to create pod webhook", "webhook", "LeaderWorkerSet")
+			os.Exit(1)
+		}
+		if err := disaggregatedsetwebhook.SetupDisaggregatedSetWebhook(mgr); err != nil {
+			setupLog.Error(err, "unable to create disaggregatedset webhook", "webhook", "DisaggregatedSet")
 			os.Exit(1)
 		}
 	}
@@ -286,6 +303,16 @@ func apply(configFile string,
 		options.LeaderElectionID = leaderElectionID
 	}
 
+	// 1. LWS Pattern: Parse the TLS config first
+	var parsedTLSConfig *config.TLS
+	if cfg.TLS != nil { // Note: cfg.TLS, not cfg.Webhook.TLS
+		var err error
+		parsedTLSConfig, err = config.ParseTLSOptions(cfg.TLS)
+		if err != nil {
+			return options, cfg, fmt.Errorf("unable to parse TLS options from configuration: %w", err)
+		}
+	}
+
 	// Disabling http/2 to prevent being vulnerable to the HTTP/2 Stream Cancellation and
 	// Rapid Reset CVEs. For more information see:
 	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
@@ -293,6 +320,14 @@ func apply(configFile string,
 	disableHTTP2 := func(c *tls.Config) {
 		setupLog.Info("disabling http/2")
 		c.NextProtos = []string{"http/1.1"}
+	}
+
+	serverTLSOpts := []func(*tls.Config){disableHTTP2}
+
+	// 3. LWS Pattern: Build and apply parsed TLS configuration from config
+	if parsedTLSConfig != nil {
+		tlsOpts := config.BuildTLSOptions(parsedTLSConfig)
+		serverTLSOpts = append(serverTLSOpts, tlsOpts...)
 	}
 
 	if !flagsSet["metrics-bind-address"] {
@@ -307,11 +342,18 @@ func apply(configFile string,
 		BindAddress:    metricsAddr,
 		SecureServing:  true,
 		FilterProvider: filters.WithAuthenticationAndAuthorization,
-		TLSOpts:        []func(*tls.Config){disableHTTP2},
+		TLSOpts:        serverTLSOpts,
 	}
 
 	options.Metrics = metricsServerOptions
 	options.LeaderElectionNamespace = namespace
+
+	//// 5. Inject into Webhook Server
+	//options.WebhookServer = webhook.NewServer(webhook.Options{
+	//	TLSOpts: serverTLSOpts,
+	//	CertDir: cfg.Webhook.CertDir,
+	//})
+	config.AddWebhookSettingsTo(&options, &cfg, serverTLSOpts)
 
 	setupLog.Info("Successfully loaded configuration", "config", cfgStr)
 	return options, cfg, nil

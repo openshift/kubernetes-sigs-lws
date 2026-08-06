@@ -1,4 +1,6 @@
 ## Append samples of your project ##
 resources:
 - leaderworkerset_v1_leaderworkerset.yaml
+- disaggregatedset_v1_disaggregatedset.yaml
+- disaggregatedset_v1_3role.yaml
 #+kubebuilder:scaffold:manifestskustomizesamples

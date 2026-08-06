@@ -190,7 +190,9 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 		if err = r.Create(ctx, workerStatefulSet); err != nil {
-			r.Record.Eventf(&leaderWorkerSet, &pod, corev1.EventTypeWarning, FailedCreate, Create, fmt.Sprintf("Failed to create worker statefulset for leader pod %s", pod.Name))
+			if client.IgnoreAlreadyExists(err) != nil {
+				r.Record.Eventf(&leaderWorkerSet, &pod, corev1.EventTypeWarning, FailedCreate, Create, fmt.Sprintf("Failed to create worker statefulset for leader pod %s: %v", pod.Name, err))
+			}
 			return ctrl.Result{}, client.IgnoreAlreadyExists(err)
 		}
 		r.Record.Eventf(&leaderWorkerSet, &pod, corev1.EventTypeNormal, GroupsProgressing, Create, fmt.Sprintf("Created worker statefulset for leader pod %s", pod.Name))
@@ -237,6 +239,15 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 		if revisionutils.GetRevisionKey(&leader) != revisionutils.GetRevisionKey(&pod) {
 			return false, nil
 		}
+		// Ignore worker pods from a stale worker StatefulSet (or test-owned direct pod) so
+		// background deletion of the previous group does not recreate the replacement leader again.
+		currentGroupWorkerPod, err := r.workerPodBelongsToLeader(ctx, pod, leader)
+		if err != nil {
+			return false, err
+		}
+		if !currentGroupWorkerPod {
+			return false, nil
+		}
 	} else {
 		leader = pod
 	}
@@ -252,6 +263,35 @@ func (r *PodReconciler) handleRestartPolicy(ctx context.Context, pod corev1.Pod,
 	}
 	r.Record.Eventf(&leaderWorkerSet, &leader, corev1.EventTypeNormal, "RecreateGroup", Delete, fmt.Sprintf("Worker pod %s failed, deleted leader pod %s to recreate group %s", pod.Name, leader.Name, leader.Labels[leaderworkerset.GroupIndexLabelKey]))
 	return true, nil
+}
+
+func (r *PodReconciler) workerPodBelongsToLeader(ctx context.Context, pod corev1.Pod, leader corev1.Pod) (bool, error) {
+	owner := metav1.GetControllerOf(&pod)
+	if owner == nil {
+		return false, nil
+	}
+
+	if owner.Kind == "Pod" {
+		return owner.Name == leader.Name && owner.UID == leader.UID, nil
+	}
+
+	if owner.Kind != "StatefulSet" {
+		return false, nil
+	}
+
+	var workerSts appsv1.StatefulSet
+	if err := r.Get(ctx, types.NamespacedName{Name: owner.Name, Namespace: pod.Namespace}, &workerSts); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if workerSts.UID != owner.UID {
+		return false, nil
+	}
+
+	stsOwner := metav1.GetControllerOf(&workerSts)
+	if stsOwner == nil {
+		return false, nil
+	}
+	return stsOwner.Kind == "Pod" && stsOwner.Name == leader.Name && stsOwner.UID == leader.UID, nil
 }
 
 func (r *PodReconciler) setNodeSelectorForWorkerPods(ctx context.Context, pod *corev1.Pod, sts *appsapplyv1.StatefulSetApplyConfiguration, topologyKey string) error {
@@ -379,6 +419,9 @@ func constructWorkerStatefulSetApplyConfiguration(leaderPod corev1.Pod, lws lead
 		podAnnotations[leaderworkerset.ExclusiveKeyAnnotationKey] = lws.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]
 	}
 	if lws.Spec.LeaderWorkerTemplate.SubGroupPolicy != nil {
+		if lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type != nil {
+			podAnnotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey] = string(*lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type)
+		}
 		podAnnotations[leaderworkerset.SubGroupSizeAnnotationKey] = strconv.Itoa(int(*lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize))
 		if lws.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] != "" {
 			podAnnotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] = lws.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]
@@ -391,6 +434,7 @@ func constructWorkerStatefulSetApplyConfiguration(leaderPod corev1.Pod, lws lead
 		serviceName = lws.Name
 	}
 	// construct statefulset apply configuration
+	statefulSetLabels := mergeMetadata(lws.Labels, labelMap)
 	statefulSetConfig := appsapplyv1.StatefulSet(leaderPod.Name, leaderPod.Namespace).
 		WithSpec(appsapplyv1.StatefulSetSpec().
 			WithServiceName(serviceName).
@@ -400,7 +444,8 @@ func constructWorkerStatefulSetApplyConfiguration(leaderPod corev1.Pod, lws lead
 			WithOrdinals(appsapplyv1.StatefulSetOrdinals().WithStart(1)).
 			WithSelector(metaapplyv1.LabelSelector().
 				WithMatchLabels(selectorMap))).
-		WithLabels(labelMap)
+		WithLabels(statefulSetLabels).
+		WithAnnotations(lws.Annotations)
 
 	pvcApplyConfiguration := controllerutils.GetPVCApplyConfiguration(&lws)
 	if len(pvcApplyConfiguration) > 0 {

@@ -34,6 +34,26 @@ Get started with [installation](../installation/) or watch the LWS-related [talk
 
 Read the [examples](https://github.com/kubernetes-sigs/lws/tree/main/docs/examples) to learn more.
 
+## Disaggregated Inference with DisaggregatedSet
+
+For workloads that require separating inference phases (e.g., prefill and decode), LWS provides
+the **DisaggregatedSet** operator. DisaggregatedSet builds on LeaderWorkerSet to add advanced
+disaggregated workload deployment, with support for coordinated rollouts and failure handling.
+
+Key features of DisaggregatedSet include:
+- **Disaggregated Architecture Support:** Specifically designed for workloads where different phases (e.g., prefill and decode) run on separate infrastructure.
+- **Coordinated N-Dimensional Rollouts:** Updates multiple roles (2–10) in lockstep, preserving capacity ratios throughout the update process.
+- **Unified Lifecycle Management:** Manages multiple underlying LeaderWorkerSets as a single logical unit.
+- **Automatic Service Orchestration:** Automatically creates and manages headless services for each role to facilitate discovery and revision-aware routing.
+- **Advanced Failure Handling:** Coordinated drain and restart policies across all roles in the disaggregated set.
+
+Learn more:
+- [Concepts: DisaggregatedSet](../concepts/disaggregatedset/) — how it relates to LeaderWorkerSet and when to use it
+- [Installation](../installation/#disaggregatedset) — DisaggregatedSet ships with the LWS operator (v0.9.0+)
+- [Examples](../examples/disaggregatedset/) — minimal multi-role demos and day-2 operations
+- [API reference](../reference/disaggregatedset.v1/) — `disaggregatedset.x-k8s.io/v1` field reference
+- [KEP-766](https://github.com/kubernetes-sigs/lws/tree/main/keps/766-DisaggregatedSet) — design document
+
 ## Community, Discussion, Contribution, and Support
 
 Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).

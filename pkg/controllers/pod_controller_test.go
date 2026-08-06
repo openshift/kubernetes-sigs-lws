@@ -23,13 +23,16 @@ import (
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	appsapplyv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	coreapplyv1 "k8s.io/client-go/applyconfigurations/core/v1"
 	metaapplyv1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
@@ -163,6 +166,9 @@ func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 						leaderworkerset.GroupUniqueHashLabelKey: "test-key",
 						leaderworkerset.RevisionKey:             updateRevisionKey,
 					},
+					Annotations: map[string]string{
+						"leaderworkerset.sigs.k8s.io/exclusive-topology": "topologyKey",
+					},
 				},
 				Spec: &appsapplyv1.StatefulSetSpecApplyConfiguration{
 					Replicas: ptr.To[int32](1),
@@ -225,7 +231,7 @@ func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 				WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
 				Annotation(map[string]string{
 					leaderworkerset.SubGroupExclusiveKeyAnnotationKey: "topologyKey",
-				}).Size(2).SubGroupSize(2).Obj(),
+				}).Size(2).SubGroupSize(2).SubGroupType(leaderworkerset.SubGroupPolicyTypeLeaderExcluded).Obj(),
 			wantStatefulSetConfig: &appsapplyv1.StatefulSetApplyConfiguration{
 				TypeMetaApplyConfiguration: metaapplyv1.TypeMetaApplyConfiguration{
 					Kind:       ptr.To[string]("StatefulSet"),
@@ -239,6 +245,9 @@ func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 						leaderworkerset.GroupIndexLabelKey:      "1",
 						leaderworkerset.RevisionKey:             updateRevisionKey,
 						leaderworkerset.GroupUniqueHashLabelKey: "test-key",
+					},
+					Annotations: map[string]string{
+						leaderworkerset.SubGroupExclusiveKeyAnnotationKey: "topologyKey",
 					},
 				},
 				Spec: &appsapplyv1.StatefulSetSpecApplyConfiguration{
@@ -263,6 +272,7 @@ func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 								"leaderworkerset.sigs.k8s.io/leader-name":         "test-sample",
 								leaderworkerset.SubGroupExclusiveKeyAnnotationKey: "topologyKey",
 								leaderworkerset.SubGroupSizeAnnotationKey:         "2",
+								leaderworkerset.SubGroupPolicyTypeAnnotationKey:   "LeaderExcluded",
 							},
 						},
 						Spec: &coreapplyv1.PodSpecApplyConfiguration{
@@ -416,6 +426,166 @@ func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantStatefulSetConfig, statefulSetConfig); diff != "" {
 				t.Errorf("unexpected StatefulSet apply operation %s", diff)
+			}
+		})
+	}
+}
+
+func TestWorkerStatefulSetApplyConfigPropagatesObjectMeta(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+	lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+		Labels(map[string]string{
+			"app":                              "inference",
+			leaderworkerset.GroupIndexLabelKey: "user-value",
+		}).
+		Annotation(map[string]string{"owner": "platform"}).
+		Replica(1).
+		WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
+		Size(2).
+		Obj()
+	revision, err := revisionutils.NewRevision(context.TODO(), client, lws, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionKey := revisionutils.GetRevisionKey(revision)
+
+	leaderPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-sample",
+			Namespace: "default",
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:         "test-sample",
+				leaderworkerset.GroupIndexLabelKey:      "1",
+				leaderworkerset.GroupUniqueHashLabelKey: "test-key",
+				leaderworkerset.RevisionKey:             revisionKey,
+			},
+		},
+	}
+
+	statefulSetConfig, err := constructWorkerStatefulSetApplyConfiguration(leaderPod, *lws, revision)
+	if err != nil {
+		t.Fatalf("failed with error %s", err.Error())
+	}
+
+	wantLabels := map[string]string{
+		"app":                                   "inference",
+		leaderworkerset.SetNameLabelKey:         "test-sample",
+		leaderworkerset.GroupIndexLabelKey:      "1",
+		leaderworkerset.GroupUniqueHashLabelKey: "test-key",
+		leaderworkerset.RevisionKey:             revisionKey,
+	}
+	if diff := cmp.Diff(wantLabels, statefulSetConfig.Labels); diff != "" {
+		t.Errorf("unexpected StatefulSet labels: %s", diff)
+	}
+
+	wantAnnotations := map[string]string{"owner": "platform"}
+	if diff := cmp.Diff(wantAnnotations, statefulSetConfig.Annotations); diff != "" {
+		t.Errorf("unexpected StatefulSet annotations: %s", diff)
+	}
+}
+
+func TestHandleRestartPolicyUsesCurrentWorkerOwnership(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Size(2).RestartPolicy(leaderworkerset.RecreateGroupOnPodRestart).Obj()
+	revisionKey := "revision-1"
+
+	makeLeaderPod := func(uid types.UID) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      lws.Name + "-0",
+				Namespace: lws.Namespace,
+				UID:       uid,
+				Labels: map[string]string{
+					leaderworkerset.SetNameLabelKey:     lws.Name,
+					leaderworkerset.WorkerIndexLabelKey: "0",
+					leaderworkerset.GroupIndexLabelKey:  "0",
+					leaderworkerset.RevisionKey:         revisionKey,
+				},
+			},
+		}
+	}
+
+	makeWorkerStatefulSet := func(uid types.UID, leader *corev1.Pod) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            leader.Name,
+				Namespace:       leader.Namespace,
+				UID:             uid,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(leader, corev1.SchemeGroupVersion.WithKind("Pod"))},
+			},
+		}
+	}
+
+	makeWorkerPod := func(owner metav1.OwnerReference) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      lws.Name + "-0-1",
+				Namespace: lws.Namespace,
+				Labels: map[string]string{
+					leaderworkerset.SetNameLabelKey:     lws.Name,
+					leaderworkerset.WorkerIndexLabelKey: "1",
+					leaderworkerset.GroupIndexLabelKey:  "0",
+					leaderworkerset.RevisionKey:         revisionKey,
+				},
+				OwnerReferences: []metav1.OwnerReference{owner},
+			},
+		}
+	}
+
+	deletingWorker := func(w *corev1.Pod) corev1.Pod {
+		p := w.DeepCopy()
+		now := v1.Now()
+		p.DeletionTimestamp = &now
+		return *p
+	}
+
+	stsRef := func(s *appsv1.StatefulSet) metav1.OwnerReference {
+		return *metav1.NewControllerRef(s, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))
+	}
+
+	currentLeader := makeLeaderPod("leader-current")
+	currentSts := makeWorkerStatefulSet("sts-current", currentLeader)
+	staleSts := makeWorkerStatefulSet("sts-stale", currentLeader)
+
+	tests := []struct {
+		name              string
+		objects           []client.Object
+		reconciledPod     corev1.Pod
+		wantLeaderDeleted bool
+	}{
+		{
+			name:              "current worker statefulset owner triggers group recreation",
+			objects:           []client.Object{currentLeader, currentSts, makeWorkerPod(stsRef(currentSts))},
+			reconciledPod:     deletingWorker(makeWorkerPod(stsRef(currentSts))),
+			wantLeaderDeleted: true,
+		},
+		{
+			name:              "stale worker statefulset owner is ignored",
+			objects:           []client.Object{currentLeader, currentSts, makeWorkerPod(stsRef(staleSts))},
+			reconciledPod:     deletingWorker(makeWorkerPod(stsRef(staleSts))),
+			wantLeaderDeleted: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithObjects(tc.objects...).Build()
+			reconciler := PodReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+
+			leaderDeleted, err := reconciler.handleRestartPolicy(context.Background(), tc.reconciledPod, *lws.DeepCopy())
+			if err != nil {
+				t.Fatalf("handleRestartPolicy() error = %v", err)
+			}
+			if leaderDeleted != tc.wantLeaderDeleted {
+				t.Fatalf("handleRestartPolicy() leaderDeleted = %t, want %t", leaderDeleted, tc.wantLeaderDeleted)
+			}
+
+			var leader corev1.Pod
+			err = fakeClient.Get(context.Background(), client.ObjectKey{Name: lws.Name + "-0", Namespace: lws.Namespace}, &leader)
+			if tc.wantLeaderDeleted && !apierrors.IsNotFound(err) {
+				t.Fatalf("leader pod still exists after recreation trigger, err = %v", err)
+			}
+			if !tc.wantLeaderDeleted && err != nil {
+				t.Fatalf("leader pod should still exist, err = %v", err)
 			}
 		})
 	}

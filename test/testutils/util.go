@@ -392,6 +392,7 @@ func SetPodGroupToReady(ctx context.Context, k8sClient client.Client, statefulse
 		}
 
 		sts.Status.ReadyReplicas = *sts.Spec.Replicas
+		sts.Status.AvailableReplicas = *sts.Spec.Replicas
 		sts.Status.Replicas = *sts.Spec.Replicas
 		sts.Status.CurrentRevision = ""
 		sts.Status.UpdateRevision = ""
@@ -401,9 +402,12 @@ func SetPodGroupToReady(ctx context.Context, k8sClient client.Client, statefulse
 
 // SetStatefulsetToUnReady set statefulset to unready.
 func SetStatefulsetToUnReady(ctx context.Context, k8sClient client.Client, sts *appsv1.StatefulSet) {
-	sts.Status.CurrentRevision = "fuz"
-	sts.Status.UpdateRevision = "bar"
-	gomega.Expect(k8sClient.Status().Update(ctx, sts)).Should(gomega.Succeed())
+	gomega.Eventually(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(sts), sts)).To(gomega.Succeed())
+		sts.Status.CurrentRevision = "fuz"
+		sts.Status.UpdateRevision = "bar"
+		g.Expect(k8sClient.Status().Update(ctx, sts)).To(gomega.Succeed())
+	}, Timeout, Interval).Should(gomega.Succeed())
 }
 
 func CheckLeaderWorkerSetHasCondition(ctx context.Context, k8sClient client.Client, lws *leaderworkerset.LeaderWorkerSet, condition metav1.Condition) (bool, error) {
@@ -413,6 +417,9 @@ func CheckLeaderWorkerSetHasCondition(ctx context.Context, k8sClient client.Clie
 	}
 	for _, c := range fetchedLWS.Status.Conditions {
 		if c.Type == condition.Type && c.Status == condition.Status {
+			if c.ObservedGeneration != fetchedLWS.Generation {
+				return false, nil
+			}
 			if condition.Message != "" {
 				return condition.Message == c.Message, nil
 			}
@@ -527,7 +534,7 @@ func CheckTPUContainerHasCorrectEnvVars(pod corev1.Pod, envVal string) error {
 					workerIndex, _ := strconv.Atoi(pod.Labels[leaderworkerset.WorkerIndexLabelKey])
 					subGroupSize, _ := strconv.Atoi(subGroupSizeStr)
 					podWorkerIndex := (workerIndex) % subGroupSize
-					if pod.Annotations[acceleratorutils.LeaderRequestsTPUsAnnotationKey] != "true" {
+					if workerIndex != 0 && pod.Annotations[acceleratorutils.LeaderRequestsTPUsAnnotationKey] != "true" {
 						podWorkerIndex = (workerIndex - 1) % subGroupSize
 					}
 					expectedIndex = podWorkerIndex*numTPUContainers + i
@@ -703,6 +710,7 @@ func SetLeaderPodsToReady(ctx context.Context, k8sClient client.Client, lws *lea
 			return err
 		}
 		sts.Status.ReadyReplicas = *sts.Spec.Replicas
+		sts.Status.AvailableReplicas = *sts.Spec.Replicas
 		sts.Status.Replicas = *sts.Spec.Replicas
 		sts.Status.CurrentRevision = ""
 		sts.Status.UpdateRevision = ""
