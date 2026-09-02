@@ -9,7 +9,19 @@
   "rebaseWhen": "behind-base-branch",
   "recreateWhen": "always",
   "commitMessageSuffix": "{{baseBranch}}",
-  "ignorePaths": ["**/cmd/**", "**/hack/internal/**", "**/vendor/**", "Dockerfile", "/site/**", "/keps/**", "/docs/**"],
+  "ignorePaths": [
+    "**/cmd/**",
+    "**/hack/internal/**",
+    "**/vendor/**",
+    "Dockerfile",
+    "/site/**",
+    "/keps/**",
+    "/docs/**",
+    ".github/**"
+  ],
+  "github-actions": {
+    "enabled": false
+  },
   "tekton": {
     "enabled": true,
     "packageRules": [
