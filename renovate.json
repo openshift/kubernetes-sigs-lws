@@ -14,9 +14,9 @@
     "**/hack/internal/**",
     "**/vendor/**",
     "Dockerfile",
-    "/site/**",
-    "/keps/**",
-    "/docs/**",
+    "site/**",
+    "keps/**",
+    "docs/**",
     ".github/**"
   ],
   "github-actions": {
