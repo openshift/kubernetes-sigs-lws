@@ -9,4 +9,6 @@ verify-ocp: manifests
 
 .PHONY: build-ocp
 build-ocp: fmt vet
+	@[ "$$(grep -cE '^LABEL (release|version)="$(CHART_VERSION)"$$' Dockerfile.ocp)" = 2 ] || { echo "Dockerfile.ocp LABEL release/version != $(CHART_VERSION)"; exit 1; }
 	$(GO_BUILD_ENV) $(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/manager cmd/main.go
+
