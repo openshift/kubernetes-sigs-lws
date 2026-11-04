@@ -1,0 +1,93 @@
+suite: controller manager ClusterRole
+templates:
+  - templates/rbac/role.yaml
+release:
+  name: lws
+  namespace: lws-system
+tests:
+  - it: grants no Volcano permissions by default
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - scheduling.volcano.sh
+          any: true
+
+  - it: grants access to Volcano PodGroups with Volcano gang scheduling
+    set:
+      gangSchedulingManagement:
+        schedulerProvider: volcano
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - scheduling.volcano.sh
+            resources:
+              - podgroups
+            verbs:
+              - create
+              - get
+              - list
+              - watch
+
+  - it: grants no ComputeDomain permissions by default
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - resource.nvidia.com
+          any: true
+
+  - it: grants access to ComputeDomains with computeDomainManagement.enabled
+    set:
+      computeDomainManagement:
+        enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - resource.nvidia.com
+            resources:
+              - computedomains
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - update
+              - watch
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - resource.nvidia.com
+            resources:
+              - computedomains/finalizers
+            verbs:
+              - update
+
+  - it: grants access to ComputeDomains when the AutoComputeDomain feature gate is enabled
+    set:
+      featureGates:
+        AutoComputeDomain: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - resource.nvidia.com
+            resources:
+              - computedomains
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - update
+              - watch

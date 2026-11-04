@@ -28,6 +28,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
@@ -57,13 +58,39 @@ internalCertManagement:
 		t.Fatal(err)
 	}
 
+	testConfigV1 := filepath.Join(tmpDir, "test_config_v1.yaml")
+	if err := os.WriteFile(testConfigV1, []byte(`
+apiVersion: config.lws.x-k8s.io/v1
+kind: Configuration
+health:
+  healthProbeBindAddress: :8081
+leaderElection:
+  leaderElect: true
+  resourceName: test
+  leaseDuration: 5m
+  renewDeadline: 5m
+  retryPeriod: 5m
+  resourceLock: test
+webhook:
+  port: 9443
+internalCertManagement:
+  enable: true
+  webhookServiceName: lws-tenant-a-webhook-service
+  webhookSecretName: lws-tenant-a-webhook-server-cert
+`), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
 	ctrlOptsCmpOpts := []cmp.Option{
 		cmpopts.IgnoreUnexported(ctrl.Options{}),
 		cmpopts.IgnoreUnexported(webhook.DefaultServer{}),
 		cmpopts.IgnoreUnexported(ctrlcache.Options{}),
+		cmpopts.IgnoreFields(ctrlcache.Options{}, "ByObject"),
 		cmpopts.IgnoreUnexported(net.ListenConfig{}),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger", "Metrics", "WebhookServer", "LeaderElectionNamespace"),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Controller", "Logger"),
+		// client.Options.Log holds a real logr.Logger with an unexported sink.
+		cmpopts.IgnoreFields(ctrlclient.Options{}, "Log"),
 	}
 
 	testCases := []struct {
@@ -155,6 +182,29 @@ internalCertManagement:
 				RenewDeadline:              ptr.To(5 * time.Minute),
 				RetryPeriod:                ptr.To(5 * time.Minute),
 				HealthProbeBindAddress:     ":9443",
+				LivenessEndpointName:       "/healthz",
+				ReadinessEndpointName:      "/readyz",
+			},
+		},
+		{
+			name:                     "v1 config no flag overwrite",
+			configFile:               testConfigV1,
+			flagtrack:                map[string]bool{},
+			probeAddr:                ":9443",
+			enableLeaderElection:     false,
+			leaderElectLeaseDuration: 1 * time.Minute,
+			leaderElectRenewDeadline: 1 * time.Minute,
+			leaderElectRetryPeriod:   1 * time.Minute,
+			leaderElectResourceLock:  "changed",
+			leaderElectionID:         "changed",
+			expectedOpts: ctrl.Options{
+				LeaderElection:             true,
+				LeaderElectionResourceLock: "test",
+				LeaderElectionID:           "test",
+				LeaseDuration:              ptr.To(5 * time.Minute),
+				RenewDeadline:              ptr.To(5 * time.Minute),
+				RetryPeriod:                ptr.To(5 * time.Minute),
+				HealthProbeBindAddress:     ":8081",
 				LivenessEndpointName:       "/healthz",
 				ReadinessEndpointName:      "/readyz",
 			},

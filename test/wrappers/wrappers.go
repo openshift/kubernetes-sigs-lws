@@ -146,6 +146,24 @@ func (lwsWrapper *LeaderWorkerSetWrapper) SubdomainPolicy(subdomainPolicy leader
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) PodTerminationPolicy(policy leaderworkerset.PodTerminationPolicyType) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.PodTerminationPolicy = policy
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) MaxGroupRestarts(n int32) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.MaxGroupRestarts = ptr.To[int32](n)
+	return lwsWrapper
+}
+
+func (lwsWrapper *LeaderWorkerSetWrapper) RestartBackoff(baseSeconds, capSeconds *int32) *LeaderWorkerSetWrapper {
+	lwsWrapper.Spec.LeaderWorkerTemplate.RestartBackoff = &leaderworkerset.RestartBackoff{
+		BaseSeconds: baseSeconds,
+		CapSeconds:  capSeconds,
+	}
+	return lwsWrapper
+}
+
 func (lwsWrapper *LeaderWorkerSetWrapper) SubdomainNil() *LeaderWorkerSetWrapper {
 	lwsWrapper.Spec.NetworkConfig = nil
 	return lwsWrapper
@@ -199,6 +217,11 @@ func (lwsWrapper *LeaderWorkerSetWrapper) ReadyReplicas(n int32) *LeaderWorkerSe
 	return lwsWrapper
 }
 
+func (lwsWrapper *LeaderWorkerSetWrapper) UpdatedReplicas(n int32) *LeaderWorkerSetWrapper {
+	lwsWrapper.Status.UpdatedReplicas = n
+	return lwsWrapper
+}
+
 func (lwsWrapper *LeaderWorkerSetWrapper) CreationTimestamp(t time.Time) *LeaderWorkerSetWrapper {
 	lwsWrapper.ObjectMeta.CreationTimestamp = metav1.Time{Time: t}
 	return lwsWrapper
@@ -244,6 +267,9 @@ func BuildLeaderWorkerSet(nsName string) *LeaderWorkerSetWrapper {
 		},
 	}
 	lws.Spec.StartupPolicy = leaderworkerset.LeaderCreatedStartupPolicy
+	lws.Spec.GroupIdentity = leaderworkerset.GroupIdentityOrdinal
+	lws.Spec.GroupReplacementPolicy = leaderworkerset.GroupReplacementPostTermination
+	lws.Spec.PodTerminationPolicy = leaderworkerset.SequentialPodTerminationPolicy
 	subdomainPolicy := leaderworkerset.SubdomainShared
 	lws.Spec.NetworkConfig = &leaderworkerset.NetworkConfig{
 		SubdomainPolicy: &subdomainPolicy,

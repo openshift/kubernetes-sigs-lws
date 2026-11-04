@@ -8,12 +8,21 @@ metadata:
 data:
   controller_manager_config.yaml: |2
 
-    apiVersion: config.lws.x-k8s.io/v1alpha1
+    apiVersion: config.lws.x-k8s.io/v1
     kind: Configuration
     leaderElection:
       leaderElect: true
+      {{- with pick (.Values.leaderElection | default dict) "leaseDuration" "renewDeadline" "retryPeriod" }}
+{{ toYaml . | indent 6 }}
+      {{- end }}
+    webhook:
+      port: {{ .Values.service.port }}
     internalCertManagement:
       enable: {{ not .Values.enableCertManager }}
+    {{- if .Values.featureGates }}
+    featureGates:
+{{ toYaml .Values.featureGates | indent 6 }}
+    {{- end }}
     {{- if .Values.gangSchedulingManagement }}
     gangSchedulingManagement:
 {{ toYaml .Values.gangSchedulingManagement | indent 6 }}

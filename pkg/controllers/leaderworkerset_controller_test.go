@@ -18,28 +18,40 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsapplyv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	coreapplyv1 "k8s.io/client-go/applyconfigurations/core/v1"
 	metaapplyv1 "k8s.io/client-go/applyconfigurations/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/lru"
 	"k8s.io/utils/ptr"
 
+	disaggregatedset "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
 	"sigs.k8s.io/lws/test/wrappers"
 )
@@ -47,6 +59,224 @@ import (
 type fakeEventRecorder struct{}
 
 func (fakeEventRecorder) Eventf(regarding runtime.Object, related runtime.Object, eventtype, reason, action, note string, args ...interface{}) {
+}
+
+func TestParallelWorkerCleanupOwnership(t *testing.T) {
+	for _, identity := range []leaderworkerset.GroupIdentityType{leaderworkerset.GroupIdentityOrdinal, leaderworkerset.GroupIdentityHash} {
+		scenarios := []string{"owned", "unowned", "missing leader", "replaced leader", "wrong owner kind", "wrong owner version", "missing workload", "replaced workload", "foreign LWS", "read error", "replacement during delete"}
+		if identity == leaderworkerset.GroupIdentityHash {
+			scenarios = append(scenarios, "replaced replica set", "missing replica set", "replica set read error", "literal without setup")
+		}
+		for _, scenario := range scenarios {
+			t.Run(string(identity)+"/"+scenario, func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				require.NoError(t, leaderworkerset.AddToScheme(scheme))
+				require.NoError(t, appsv1.AddToScheme(scheme))
+				require.NoError(t, corev1.AddToScheme(scheme))
+				lws := &leaderworkerset.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "lws"}}
+				lws.Spec.GroupIdentity = identity
+				workloadMeta := metav1.ObjectMeta{Name: lws.Name, Namespace: lws.Namespace, UID: "leaders", OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))}}
+				var workload client.Object = &appsv1.StatefulSet{ObjectMeta: workloadMeta}
+				leaderOwner := metav1.NewControllerRef(workload, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))
+				objects := []client.Object{lws}
+				if identity == leaderworkerset.GroupIdentityHash {
+					workload = &appsv1.Deployment{ObjectMeta: workloadMeta}
+					rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+						Name:            "model-rs",
+						Namespace:       lws.Namespace,
+						UID:             "rs",
+						Labels:          map[string]string{leaderworkerset.SetNameLabelKey: lws.Name},
+						OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(workload, appsv1.SchemeGroupVersion.WithKind("Deployment"))},
+					}}
+					if scenario != "missing replica set" {
+						objects = append(objects, rs)
+					}
+					leaderOwner = metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))
+					if scenario == "replaced replica set" {
+						rs.UID = "replacement"
+					}
+				}
+				leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "model-0", Namespace: lws.Namespace, UID: "leader", OwnerReferences: []metav1.OwnerReference{*leaderOwner}}}
+				workers := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+					Name: leader.Name, Namespace: lws.Namespace, UID: "workers",
+					Labels:          map[string]string{leaderworkerset.SetNameLabelKey: lws.Name, leaderworkerset.RoleLabelKey: leaderworkerset.RoleWorker},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(leader, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				}}
+				switch scenario {
+				case "unowned":
+					workers.OwnerReferences = nil
+				case "replaced leader":
+					leader.UID = "replacement"
+				case "wrong owner kind":
+					workers.OwnerReferences[0].Kind = "ReplicaSet"
+				case "wrong owner version":
+					workers.OwnerReferences[0].APIVersion = "other.example/v1"
+				case "replaced workload":
+					workload.SetUID("replacement")
+				case "foreign LWS":
+					workload.GetOwnerReferences()[0].UID = "another-lws"
+				}
+				objects = append(objects, workers)
+				if scenario != "missing workload" {
+					objects = append(objects, workload)
+				}
+				if scenario != "missing leader" {
+					objects = append(objects, leader)
+				}
+				storage := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+				withoutSetup := scenario == "literal without setup"
+				replicaSetReads := 0
+				cl := interceptor.NewClient(storage, interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, isReplicaSet := obj.(*appsv1.ReplicaSet); isReplicaSet {
+							replicaSetReads++
+							if scenario == "replica set read error" {
+								return fmt.Errorf("owner lookup failed")
+							}
+						} else if scenario == "read error" {
+							return fmt.Errorf("owner lookup failed")
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if scenario == "replacement during delete" {
+							require.NoError(t, c.Delete(ctx, workers))
+							replacement := workers.DeepCopy()
+							replacement.UID, replacement.OwnerReferences = "replacement", nil
+							replacement.ResourceVersion = ""
+							require.NoError(t, c.Create(ctx, replacement))
+							// The fake client does not enforce UID preconditions.
+							options := (&client.DeleteOptions{}).ApplyOptions(opts)
+							require.NotNil(t, options.Preconditions)
+							require.Equal(t, workers.UID, ptr.Deref(options.Preconditions.UID, ""))
+							return apierrors.NewConflict(appsv1.Resource("statefulsets"), obj.GetName(), fmt.Errorf("UID precondition failed"))
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				r := NewLeaderWorkerSetReconciler(cl, scheme, events.NewFakeRecorder(5))
+				if scenario == "literal without setup" {
+					r = &LeaderWorkerSetReconciler{Client: cl, Scheme: scheme}
+				}
+				var err error
+				require.NotPanics(t, func() { err = r.deleteWorkerStatefulSets(t.Context(), lws) })
+				if identity == leaderworkerset.GroupIdentityOrdinal {
+					require.Zero(t, replicaSetReads)
+				} else if scenario == "owned" || withoutSetup {
+					require.Equal(t, 1, replicaSetReads)
+				}
+				switch scenario {
+				case "read error", "replica set read error":
+					require.ErrorContains(t, err, "owner lookup failed")
+				case "replacement during delete":
+					require.True(t, apierrors.IsConflict(err), "stale cleanup must conflict: %v", err)
+				default:
+					require.NoError(t, err)
+				}
+				var remaining appsv1.StatefulSetList
+				require.NoError(t, cl.List(t.Context(), &remaining, client.MatchingLabels{leaderworkerset.RoleLabelKey: leaderworkerset.RoleWorker}))
+				if scenario == "owned" || withoutSetup {
+					require.Empty(t, remaining.Items)
+				} else {
+					require.Len(t, remaining.Items, 1, "unverified or replaced workers must survive")
+				}
+			})
+		}
+	}
+}
+
+func TestParallelWorkerCleanupReusesReplicaSets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, leaderworkerset.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	lws := &leaderworkerset.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "default", UID: "lws"}}
+	lws.Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
+	deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: lws.Name, Namespace: lws.Namespace, UID: "deployment",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))},
+	}}
+	rsA := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "rs-a", Namespace: lws.Namespace, UID: "rs-a",
+		Labels:          map[string]string{leaderworkerset.SetNameLabelKey: lws.Name},
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(deployment, appsv1.SchemeGroupVersion.WithKind("Deployment"))},
+	}}
+	rsB := rsA.DeepCopy()
+	rsB.Name, rsB.UID = "rs-b", "rs-b"
+	ownerA := *metav1.NewControllerRef(rsA, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))
+	ownerB := *metav1.NewControllerRef(rsB, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))
+	staleOwner := ownerA
+	staleOwner.UID = "old-rs-a"
+	objects := []client.Object{lws, deployment, rsA} // rs-b is initially missing.
+	for i, owner := range []metav1.OwnerReference{ownerA, ownerA, staleOwner, ownerB, ownerB} {
+		name := fmt.Sprintf("model-%d", i)
+		leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: lws.Namespace, UID: types.UID(name), OwnerReferences: []metav1.OwnerReference{owner},
+		}}
+		workers := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: lws.Namespace, UID: types.UID(name + "-workers"),
+			Labels:          map[string]string{leaderworkerset.SetNameLabelKey: lws.Name, leaderworkerset.RoleLabelKey: leaderworkerset.RoleWorker},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(leader, corev1.SchemeGroupVersion.WithKind("Pod"))},
+		}}
+		objects = append(objects, leader, workers)
+	}
+	storage := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	reads := map[string]int{}
+	cl := interceptor.NewClient(storage, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isReplicaSet := obj.(*appsv1.ReplicaSet); isReplicaSet {
+				reads[key.Name]++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := NewLeaderWorkerSetReconciler(cl, scheme, events.NewFakeRecorder(5))
+	require.NoError(t, r.deleteWorkerStatefulSets(t.Context(), lws))
+	require.Equal(t, map[string]int{"rs-a": 1, "rs-b": 1}, reads, "read each owner once, including missing owners")
+	var remaining appsv1.StatefulSetList
+	require.NoError(t, storage.List(t.Context(), &remaining))
+	require.Len(t, remaining.Items, 3, "workers with a stale or missing owner must survive")
+
+	// A new pass must refresh both successful and missing lookups, not retain a cache.
+	require.NoError(t, storage.Create(t.Context(), rsB))
+	require.NoError(t, r.deleteWorkerStatefulSets(t.Context(), lws))
+	require.Equal(t, map[string]int{"rs-a": 2, "rs-b": 2}, reads)
+	require.NoError(t, storage.List(t.Context(), &remaining))
+	require.Len(t, remaining.Items, 1)
+	require.Equal(t, "model-2", remaining.Items[0].Name, "a reused ReplicaSet must still match each leader's owner UID")
+}
+
+func TestConfigureCacheOptions(t *testing.T) {
+	t.Run("nil ByObject map", func(t *testing.T) {
+		var opts ctrlcache.Options
+		require.NoError(t, ConfigureCacheOptions(&opts))
+		require.Len(t, opts.ByObject, 1)
+	})
+
+	t.Run("preserves existing ByObject entries and scopes ReplicaSets", func(t *testing.T) {
+		existingPodKey := &corev1.Pod{}
+		opts := ctrlcache.Options{
+			ByObject: map[client.Object]ctrlcache.ByObject{
+				existingPodKey: {},
+			},
+		}
+		require.NoError(t, ConfigureCacheOptions(&opts))
+		require.Contains(t, opts.ByObject, existingPodKey, "existing ByObject entries must be preserved")
+
+		var rsByObj *ctrlcache.ByObject
+		for obj, byObj := range opts.ByObject {
+			if _, ok := obj.(*appsv1.ReplicaSet); ok {
+				copied := byObj
+				rsByObj = &copied
+				break
+			}
+		}
+		require.NotNil(t, rsByObj)
+		require.NotNil(t, rsByObj.Label)
+		require.Equal(t, leaderworkerset.SetNameLabelKey, rsByObj.Label.String())
+		require.True(t, rsByObj.Label.Matches(labels.Set{leaderworkerset.SetNameLabelKey: "model"}))
+		require.False(t, rsByObj.Label.Matches(labels.Set{"app": "other"}))
+	})
 }
 
 func TestLeaderStatefulSetApplyConfig(t *testing.T) {
@@ -100,6 +330,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "1"},
 				},
@@ -168,6 +399,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{
 						"leaderworkerset.sigs.k8s.io/exclusive-topology": "topologyKey",
@@ -240,6 +472,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey1,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{
 						"leaderworkerset.sigs.k8s.io/exclusive-topology": "topologyKey",
@@ -310,6 +543,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "1"},
 				},
@@ -377,6 +611,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "1"},
 				},
@@ -447,6 +682,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey1,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{
 						"leaderworkerset.sigs.k8s.io/replicas":                    "1",
@@ -539,6 +775,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "1"},
 				},
@@ -635,6 +872,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "0"},
 				},
@@ -706,6 +944,7 @@ func TestLeaderStatefulSetApplyConfig(t *testing.T) {
 					Labels: map[string]string{
 						"leaderworkerset.sigs.k8s.io/name":                   "test-sample",
 						"leaderworkerset.sigs.k8s.io/template-revision-hash": revisionKey2,
+						"leaderworkerset.sigs.k8s.io/role":                   "leader",
 					},
 					Annotations: map[string]string{"leaderworkerset.sigs.k8s.io/replicas": "2"},
 				},
@@ -799,6 +1038,7 @@ func TestLeaderStatefulSetApplyConfigPropagatesObjectMeta(t *testing.T) {
 		"app":                           "inference",
 		leaderworkerset.SetNameLabelKey: "test-sample",
 		leaderworkerset.RevisionKey:     "revision-1",
+		leaderworkerset.RoleLabelKey:    leaderworkerset.RoleLeader,
 	}
 	if diff := cmp.Diff(wantLabels, stsApplyConfig.Labels); diff != "" {
 		t.Errorf("unexpected StatefulSet labels: %s", diff)
@@ -1066,6 +1306,71 @@ func TestRollingUpdateParametersTemplateUpdateReclaimsSurgeWhenAllowed(t *testin
 	}
 }
 
+func TestDSOrdinalScaleDownDoesNotWaitForStartup(t *testing.T) {
+	for _, size := range []int{1, 2} {
+		for _, tc := range []struct {
+			name        string
+			owner       string
+			previous    string
+			partition   int32
+			newTemplate bool
+			oldGroup    bool
+			want        int32
+		}{
+			{"DS explicit scale", "ds", "4", 0, false, false, 3},
+			{"DS partition zero with old group", "ds", "4", 0, false, true, 3},
+			{"DS rollout surplus", "ds", "3", 0, false, false, 4},
+			{"DS active native partition", "ds", "4", 2, false, false, 4},
+			{"DS new template and scale", "ds", "4", 0, true, false, 4},
+			{"standalone scale unchanged", "", "4", 0, false, false, 4},
+			{"standalone partition zero with old group", "", "4", 0, false, true, 4},
+			{"unrelated controller", "other-kind", "4", 0, false, false, 4},
+			{"unrelated API", "other-api", "4", 0, false, false, 4},
+			{"DS is not the controller", "non-controller", "4", 0, false, false, 4},
+		} {
+			t.Run(fmt.Sprintf("%s/size%d", tc.name, size), func(t *testing.T) {
+				lws := wrappers.BuildLeaderWorkerSet("default").Replica(3).Size(size).
+					RolloutStrategy(leaderworkerset.RolloutStrategy{Type: leaderworkerset.RollingUpdateStrategyType,
+						RollingUpdateConfiguration: &leaderworkerset.RollingUpdateConfiguration{
+							Partition: ptr.To[int32](0), MaxSurge: intstr.FromInt(1), MaxUnavailable: intstr.FromInt(0),
+						}}).Obj()
+				// Labels alone must not opt standalone LWS into DS scaling semantics.
+				lws.Labels = map[string]string{disaggregatedset.SetNameLabelKey: "ds"}
+				if tc.owner != "" {
+					owner := metav1.OwnerReference{APIVersion: disaggregatedset.GroupVersion.String(), Kind: "DisaggregatedSet",
+						Name: "ds", UID: "ds-uid", Controller: ptr.To(true)}
+					switch tc.owner {
+					case "other-kind":
+						owner.Kind = "OtherController"
+					case "other-api":
+						owner.APIVersion = "other.example/v1"
+					case "non-controller":
+						owner.Controller = ptr.To(false)
+					}
+					lws.OwnerReferences = []metav1.OwnerReference{owner}
+				}
+				sts := lwsStatusRollingUpdateSts(lws, 4, tc.partition, tc.previous)
+				// Ordinal 1 stays unready, including when only its worker is loading.
+				var objects []client.Object
+				for i := range 4 {
+					revision := "new"
+					if tc.oldGroup && i == 0 {
+						revision = "old"
+					}
+					objects = append(objects, lwsStatusLeaderPod(lws, i, revision, size > 1 || i != 1))
+					if size > 1 {
+						objects = append(objects, lwsStatusWorkerSts(lws, i, revision, i != 1))
+					}
+				}
+				r, _ := lwsStatusNewReconciler(t, objects...)
+				_, replicas, err := r.rollingUpdateParameters(t.Context(), lws, sts, "new", tc.newTemplate)
+				require.NoError(t, err)
+				require.Equal(t, tc.want, replicas)
+			})
+		}
+	}
+}
+
 func TestSetCondition(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -1125,36 +1430,84 @@ func TestSetCondition(t *testing.T) {
 	}
 }
 
+func TestSetConditionUpdatesDetailsWithoutStatusTransition(t *testing.T) {
+	transitionTime := metav1.Now()
+	lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+		Generation(2).
+		Conditions([]metav1.Condition{{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: 1,
+			Reason:             "OldReason",
+			Message:            "old message",
+			LastTransitionTime: transitionTime,
+		}}).
+		Obj()
+
+	updated := metav1.Condition{
+		Type:               "Available",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: 2,
+		Reason:             "ReplicaRestartBudgetExceeded",
+		Message:            "Not all replicas are ready",
+	}
+	if !setCondition(lws, updated) {
+		t.Fatal("setCondition() should update changed condition details")
+	}
+	got := lws.Status.Conditions[0]
+	if got.Reason != updated.Reason || got.Message != updated.Message || got.ObservedGeneration != updated.ObservedGeneration {
+		t.Fatalf("condition details were not updated: %#v", got)
+	}
+	if !got.LastTransitionTime.Time.Equal(transitionTime.Time) {
+		t.Fatalf("LastTransitionTime changed without a status transition: got %v, want %v", got.LastTransitionTime, transitionTime)
+	}
+}
+
+func TestSetConditionPreservesOtherConditionDetailsOnExclusiveTransition(t *testing.T) {
+	lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+		Generation(1).
+		Conditions([]metav1.Condition{{
+			Type:               string(leaderworkerset.LeaderWorkerSetProgressing),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 1,
+			Reason:             GroupsProgressing,
+			Message:            "Replicas are progressing",
+		}}).
+		Obj()
+
+	if !setCondition(lws, metav1.Condition{
+		Type:               string(leaderworkerset.LeaderWorkerSetAvailable),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		Reason:             "AllGroupsReady",
+		Message:            "All replicas are ready",
+	}) {
+		t.Fatal("setCondition() should transition Progressing to False")
+	}
+	progressing := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetProgressing))
+	if progressing == nil || progressing.Status != metav1.ConditionFalse ||
+		progressing.Reason != GroupsProgressing || progressing.Message != "Replicas are progressing" {
+		t.Fatalf("Progressing condition = %#v, want False with its original details", progressing)
+	}
+}
+
 func TestGetUpdatedRevision(t *testing.T) {
 	client := fake.NewClientBuilder().Build()
 
 	tests := []struct {
 		name           string
-		sts            *appsv1.StatefulSet
 		lws            *leaderworkerset.LeaderWorkerSet
 		modifyRevision func(*appsv1.ControllerRevision)
 		expectUpdate   bool
 	}{
 		{
-			name:         "sts is nil, should return nil",
-			sts:          nil,
-			lws:          wrappers.BuildLeaderWorkerSet("default").Obj(),
-			expectUpdate: false,
-		},
-		{
-			name: "revision matches current spec, no update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
+			name:         "revision matches current spec, no update",
 			lws:          wrappers.BuildLeaderWorkerSet("default").Obj(),
 			expectUpdate: false,
 		},
 		{
 			name: "revision has old serialization with creationTimestamp null, semantic match, no update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
-			lws: wrappers.BuildLeaderWorkerSet("default").Obj(),
+			lws:  wrappers.BuildLeaderWorkerSet("default").Obj(),
 			modifyRevision: func(rev *appsv1.ControllerRevision) {
 				// Simulate old (before v1.34) client-go serialization that includes "creationTimestamp":null
 				rev.Data.Raw = []byte(strings.ReplaceAll(string(rev.Data.Raw), `"metadata":{}`, `"metadata":{"creationTimestamp":null}`))
@@ -1163,10 +1516,7 @@ func TestGetUpdatedRevision(t *testing.T) {
 		},
 		{
 			name: "revision has different spec, should trigger update",
-			sts: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-sample", Namespace: "default"},
-			},
-			lws: wrappers.BuildLeaderWorkerSet("default").Obj(),
+			lws:  wrappers.BuildLeaderWorkerSet("default").Obj(),
 			modifyRevision: func(rev *appsv1.ControllerRevision) {
 				// Simulate a real spec change by modifying the container name
 				rev.Data.Raw = []byte(strings.ReplaceAll(string(rev.Data.Raw), `"name":"leader"`, `"name":"changed"`))
@@ -1192,7 +1542,7 @@ func TestGetUpdatedRevision(t *testing.T) {
 				tc.modifyRevision(revision)
 			}
 
-			updatedRevision, err := reconciler.getUpdatedRevision(context.TODO(), tc.sts, tc.lws, revision)
+			updatedRevision, err := reconciler.getUpdatedRevision(context.TODO(), tc.lws, revision)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1207,13 +1557,13 @@ func TestGetUpdatedRevision(t *testing.T) {
 
 func TestEnqueueLWSRequests(t *testing.T) {
 	tests := []struct {
-		name        string
-		statefulSet *appsv1.StatefulSet
-		want        []reconcile.Request
+		name   string
+		object client.Object
+		want   []reconcile.Request
 	}{
 		{
 			name: "unrelated statefulset without lws label",
-			statefulSet: &appsv1.StatefulSet{
+			object: &appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "unrelated-sts",
 					Namespace: "default",
@@ -1223,7 +1573,7 @@ func TestEnqueueLWSRequests(t *testing.T) {
 		},
 		{
 			name: "statefulset with empty lws label",
-			statefulSet: &appsv1.StatefulSet{
+			object: &appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "empty-label-sts",
 					Namespace: "default",
@@ -1236,9 +1586,39 @@ func TestEnqueueLWSRequests(t *testing.T) {
 		},
 		{
 			name: "lws-managed statefulset with valid lws label",
-			statefulSet: &appsv1.StatefulSet{
+			object: &appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "lws-sts",
+					Namespace: "default",
+					Labels: map[string]string{
+						leaderworkerset.SetNameLabelKey: "my-lws",
+					},
+				},
+			},
+			want: []reconcile.Request{
+				{
+					NamespacedName: types.NamespacedName{
+						Name:      "my-lws",
+						Namespace: "default",
+					},
+				},
+			},
+		},
+		{
+			name: "unrelated pod without lws label",
+			object: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unrelated-pod",
+					Namespace: "default",
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "lws-managed pod with valid lws label",
+			object: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-lws-0-1",
 					Namespace: "default",
 					Labels: map[string]string{
 						leaderworkerset.SetNameLabelKey: "my-lws",
@@ -1258,10 +1638,923 @@ func TestEnqueueLWSRequests(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := enqueueLWSRequests(context.Background(), tc.statefulSet)
+			got := enqueueLWSRequests(context.Background(), tc.object)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("unexpected reconcile requests (-want +got):\n%s", diff)
 			}
 		})
 	}
+}
+
+func TestLeaderWorkerSetPodWatchPredicate(t *testing.T) {
+	fakeClient := fake.NewClientBuilder().Build()
+	k8sProvider := schedulerprovider.NewKubernetesProvider(fakeClient)
+	volcanoProvider := schedulerprovider.NewVolcanoProvider(fakeClient)
+
+	leaderPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-lws-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:     "test-lws",
+				leaderworkerset.WorkerIndexLabelKey: "0",
+			},
+		},
+	}
+	workerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-lws-0-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:     "test-lws",
+				leaderworkerset.WorkerIndexLabelKey: "1",
+			},
+		},
+	}
+	scheduledWorkerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-lws-0-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:     "test-lws",
+				leaderworkerset.WorkerIndexLabelKey: "1",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SchedulingGroup: &corev1.PodSchedulingGroup{
+				PodGroupName: ptr.To("test-lws-0-pg"),
+			},
+		},
+	}
+	annotatedWorkerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-lws-0-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:     "test-lws",
+				leaderworkerset.WorkerIndexLabelKey: "1",
+			},
+			Annotations: map[string]string{
+				schedulerprovider.WorkloadSchedulingAnnotationKey: "replica",
+			},
+		},
+	}
+
+	t.Run("CreateFunc", func(t *testing.T) {
+		r := &LeaderWorkerSetReconciler{SchedulerProvider: k8sProvider}
+		pred := r.podWatchPredicate()
+
+		if !pred.Create(event.CreateEvent{Object: leaderPod}) {
+			t.Errorf("expected Create(leaderPod) to be true, got false")
+		}
+		if pred.Create(event.CreateEvent{Object: workerPod}) {
+			t.Errorf("expected Create(workerPod) to be false, got true")
+		}
+		if pred.Create(event.CreateEvent{Object: nil}) {
+			t.Errorf("expected Create(nil) to be false, got true")
+		}
+	})
+
+	t.Run("UpdateFunc", func(t *testing.T) {
+		r := &LeaderWorkerSetReconciler{SchedulerProvider: k8sProvider}
+		pred := r.podWatchPredicate()
+
+		leaderWithAnnotation := leaderPod.DeepCopy()
+		leaderWithAnnotation.Annotations = map[string]string{
+			leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey: "true",
+		}
+		leaderWithUnrelatedAnnotation := leaderPod.DeepCopy()
+		leaderWithUnrelatedAnnotation.Annotations = map[string]string{
+			"unrelated": "true",
+		}
+
+		if !pred.Update(event.UpdateEvent{ObjectOld: leaderPod, ObjectNew: leaderWithAnnotation}) {
+			t.Errorf("expected Update(leaderPod -> leaderWithAnnotation) to be true, got false")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: leaderPod, ObjectNew: leaderWithUnrelatedAnnotation}) {
+			t.Errorf("expected Update(leaderPod -> leaderWithUnrelatedAnnotation) to be false, got true")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: leaderWithAnnotation, ObjectNew: leaderWithAnnotation.DeepCopy()}) {
+			t.Errorf("expected Update(leaderWithAnnotation -> leaderWithAnnotation) to be false, got true")
+		}
+		workerWithAnnotation := workerPod.DeepCopy()
+		workerWithAnnotation.Annotations = map[string]string{
+			leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey: "true",
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: workerPod, ObjectNew: workerWithAnnotation}) {
+			t.Errorf("expected Update(workerPod -> workerWithAnnotation) to be false, got true")
+		}
+		unschedulable := func(pod *corev1.Pod, reason string) *corev1.Pod {
+			pod = pod.DeepCopy()
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: reason}}
+			return pod
+		}
+		if !pred.Update(event.UpdateEvent{ObjectOld: leaderPod, ObjectNew: unschedulable(leaderPod, corev1.PodReasonUnschedulable)}) {
+			t.Errorf("expected Update(leaderPod -> unschedulable leaderPod) to be true, got false")
+		}
+		if !pred.Update(event.UpdateEvent{ObjectOld: unschedulable(leaderPod, corev1.PodReasonUnschedulable), ObjectNew: leaderPod}) {
+			t.Errorf("expected Update(unschedulable leaderPod -> leaderPod) to be true, got false")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: leaderPod, ObjectNew: unschedulable(leaderPod, corev1.PodReasonSchedulingGated)}) {
+			t.Errorf("expected Update(leaderPod -> gated leaderPod) to be false, got true")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: workerPod, ObjectNew: unschedulable(workerPod, corev1.PodReasonUnschedulable)}) {
+			t.Errorf("expected Update(workerPod -> unschedulable workerPod) to be false, got true")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: nil, ObjectNew: leaderPod}) {
+			t.Errorf("expected Update(nil, leaderPod) to be false, got true")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: leaderPod, ObjectNew: nil}) {
+			t.Errorf("expected Update(leaderPod, nil) to be false, got true")
+		}
+	})
+
+	t.Run("DeleteFunc", func(t *testing.T) {
+		rK8s := &LeaderWorkerSetReconciler{SchedulerProvider: k8sProvider}
+		predK8s := rK8s.podWatchPredicate()
+
+		rVolcano := &LeaderWorkerSetReconciler{SchedulerProvider: volcanoProvider}
+		predVolcano := rVolcano.podWatchPredicate()
+
+		rNil := &LeaderWorkerSetReconciler{SchedulerProvider: nil}
+		predNil := rNil.podWatchPredicate()
+
+		if !predK8s.Delete(event.DeleteEvent{Object: leaderPod}) {
+			t.Errorf("expected Delete(leaderPod, k8sProvider) to be true, got false")
+		}
+		if !predVolcano.Delete(event.DeleteEvent{Object: leaderPod}) {
+			t.Errorf("expected Delete(leaderPod, volcanoProvider) to be true, got false")
+		}
+		if !predNil.Delete(event.DeleteEvent{Object: leaderPod}) {
+			t.Errorf("expected Delete(leaderPod, nilProvider) to be true, got false")
+		}
+
+		if !predK8s.Delete(event.DeleteEvent{Object: scheduledWorkerPod}) {
+			t.Errorf("expected Delete(scheduledWorkerPod, k8sProvider) to be true, got false")
+		}
+		if !predK8s.Delete(event.DeleteEvent{Object: annotatedWorkerPod}) {
+			t.Errorf("expected Delete(annotatedWorkerPod, k8sProvider) to be true, got false")
+		}
+		if predK8s.Delete(event.DeleteEvent{Object: workerPod}) {
+			t.Errorf("expected Delete(workerPod, k8sProvider) to be false, got true")
+		}
+		if predVolcano.Delete(event.DeleteEvent{Object: scheduledWorkerPod}) {
+			t.Errorf("expected Delete(scheduledWorkerPod, volcanoProvider) to be false, got true")
+		}
+		if predNil.Delete(event.DeleteEvent{Object: scheduledWorkerPod}) {
+			t.Errorf("expected Delete(scheduledWorkerPod, nilProvider) to be false, got true")
+		}
+		if predK8s.Delete(event.DeleteEvent{Object: nil}) {
+			t.Errorf("expected Delete(nil) to be false, got true")
+		}
+	})
+
+	t.Run("GenericFunc", func(t *testing.T) {
+		r := &LeaderWorkerSetReconciler{SchedulerProvider: k8sProvider}
+		pred := r.podWatchPredicate()
+
+		if pred.Generic(event.GenericEvent{Object: leaderPod}) {
+			t.Errorf("expected Generic(leaderPod) to be false, got true")
+		}
+		if pred.Generic(event.GenericEvent{Object: workerPod}) {
+			t.Errorf("expected Generic(workerPod) to be false, got true")
+		}
+	})
+}
+
+func TestMakeConditionDegraded(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	condition := makeCondition(leaderworkerset.LeaderWorkerSetDegraded, lws)
+	if condition.Type != string(leaderworkerset.LeaderWorkerSetDegraded) || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("unexpected condition: %#v", condition)
+	}
+	if condition.Reason != "ReplicaRestartBudgetExceeded" {
+		t.Fatalf("reason = %q, want ReplicaRestartBudgetExceeded", condition.Reason)
+	}
+}
+
+func TestUpdateConditionsKeepsProgressingForAnotherReplica(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(2).Size(1).Obj()
+	degraded := wrappers.MakePodWithLabels(lws.Name, "0", "0", lws.Namespace, 1)
+	degraded.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	degraded.Annotations[leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey] = "true"
+	degraded.Status.Phase = corev1.PodPending
+	progressing := wrappers.MakePodWithLabels(lws.Name, "1", "0", lws.Namespace, 1)
+	progressing.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	progressing.Status.Phase = corev1.PodPending
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, degraded, progressing).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+	if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", int(*lws.Spec.Replicas)); err != nil {
+		t.Fatal(err)
+	}
+	var progressingCondition, degradedCondition *metav1.Condition
+	for i := range lws.Status.Conditions {
+		condition := &lws.Status.Conditions[i]
+		switch condition.Type {
+		case string(leaderworkerset.LeaderWorkerSetProgressing):
+			progressingCondition = condition
+		case string(leaderworkerset.LeaderWorkerSetDegraded):
+			degradedCondition = condition
+		}
+	}
+	if progressingCondition == nil || progressingCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("Progressing condition = %#v, want True", progressingCondition)
+	}
+	if degradedCondition == nil || degradedCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded condition = %#v, want True", degradedCondition)
+	}
+}
+
+func TestUpdateConditionsReportsUnschedulableGroups(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := func(status corev1.ConditionStatus, reason string) func(*corev1.Pod) {
+		return func(pod *corev1.Pod) {
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: status, Reason: reason}}
+		}
+	}
+	tests := []struct {
+		name        string
+		leaders     []func(*corev1.Pod)
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name:        "an unschedulable leader explains Progressing",
+			leaders:     []func(*corev1.Pod){scheduled(corev1.ConditionFalse, corev1.PodReasonUnschedulable), scheduled(corev1.ConditionTrue, "")},
+			wantReason:  GroupUnschedulable,
+			wantMessage: "1 replica(s) cannot be scheduled",
+		},
+		{
+			name:        "a gated leader has not been tried by the scheduler",
+			leaders:     []func(*corev1.Pod){scheduled(corev1.ConditionFalse, corev1.PodReasonSchedulingGated), scheduled(corev1.ConditionTrue, "")},
+			wantReason:  GroupsProgressing,
+			wantMessage: "Replicas are progressing",
+		},
+		{
+			name:        "a placed leader that is still starting keeps the default reason",
+			leaders:     []func(*corev1.Pod){scheduled(corev1.ConditionTrue, ""), scheduled(corev1.ConditionTrue, "")},
+			wantReason:  GroupsProgressing,
+			wantMessage: "Replicas are progressing",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lws := wrappers.BuildLeaderWorkerSet("default").Replica(2).Size(1).Obj()
+			objects := []client.Object{lws}
+			for i, mutate := range tc.leaders {
+				leader := wrappers.MakePodWithLabels(lws.Name, strconv.Itoa(i), "0", lws.Namespace, 1)
+				leader.Labels[leaderworkerset.RevisionKey] = "revision-a"
+				mutate(leader)
+				objects = append(objects, leader)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+			if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", int(*lws.Spec.Replicas)); err != nil {
+				t.Fatal(err)
+			}
+			progressing := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetProgressing))
+			if progressing == nil || progressing.Status != metav1.ConditionTrue {
+				t.Fatalf("Progressing condition = %#v, want True", progressing)
+			}
+			if progressing.Reason != tc.wantReason || progressing.Message != tc.wantMessage {
+				t.Errorf("Progressing reason, message = %q, %q, want %q, %q", progressing.Reason, progressing.Message, tc.wantReason, tc.wantMessage)
+			}
+		})
+	}
+}
+
+func TestUpdateConditionsReportsUnschedulableSurgeGroups(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Size(1).Obj()
+	unschedulable := func(index, revision string) *corev1.Pod {
+		leader := wrappers.MakePodWithLabels(lws.Name, index, "0", lws.Namespace, 1)
+		leader.Labels[leaderworkerset.RevisionKey] = revision
+		leader.Status.Phase = corev1.PodPending
+		leader.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable}}
+		return leader
+	}
+	// The desired replica still runs the old revision, so a rolling update is in progress.
+	desired := wrappers.MakePodWithLabels(lws.Name, "0", "0", lws.Namespace, 1)
+	desired.Labels[leaderworkerset.RevisionKey] = "revision-old"
+	desired.Status.Phase = corev1.PodRunning
+	desired.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	surge := unschedulable("1", "revision-a")
+	// A leader past the leader StatefulSet's replicas is about to be removed.
+	scaledDown := unschedulable("2", "revision-a")
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, desired, surge, scaledDown).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+	if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", 2); err != nil {
+		t.Fatal(err)
+	}
+	progressing := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetProgressing))
+	if progressing == nil || progressing.Status != metav1.ConditionTrue {
+		t.Fatalf("Progressing condition = %#v, want True", progressing)
+	}
+	if progressing.Reason != GroupUnschedulable || progressing.Message != "1 replica(s) cannot be scheduled" {
+		t.Errorf("Progressing reason, message = %q, %q, want %q, %q", progressing.Reason, progressing.Message, GroupUnschedulable, "1 replica(s) cannot be scheduled")
+	}
+}
+
+func TestConditionEvents(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	updating := makeCondition(leaderworkerset.LeaderWorkerSetUpdateInProgress, lws)
+	progressing := makeCondition(leaderworkerset.LeaderWorkerSetProgressing, lws)
+	notDegraded := makeFalseCondition(leaderworkerset.LeaderWorkerSetDegraded, lws, "AsExpected", "No replica has exhausted its restart budget")
+	unschedulable := func(groups int) metav1.Condition {
+		conditions := []metav1.Condition{makeCondition(leaderworkerset.LeaderWorkerSetProgressing, lws)}
+		explainUnschedulableGroups(conditions, groups)
+		return conditions[0]
+	}
+	type event struct{ reason, message, eventType string }
+
+	tests := []struct {
+		name       string
+		previous   []metav1.Condition
+		conditions []metav1.Condition
+		want       []event
+	}{
+		{
+			name:       "a primary condition without unschedulable groups is a normal event",
+			conditions: []metav1.Condition{progressing, notDegraded},
+			want:       []event{{progressing.Reason, progressing.Message, corev1.EventTypeNormal}},
+		},
+		{
+			name:       "a primary condition with unschedulable groups is a warning",
+			conditions: []metav1.Condition{unschedulable(1), notDegraded},
+			want:       []event{{GroupUnschedulable, "1 replica(s) cannot be scheduled", corev1.EventTypeWarning}},
+		},
+		{
+			name:       "a rolling update that starts with unschedulable groups reports both",
+			previous:   []metav1.Condition{progressing, notDegraded},
+			conditions: []metav1.Condition{updating, unschedulable(1), notDegraded},
+			want: []event{
+				{updating.Reason, updating.Message, corev1.EventTypeNormal},
+				{GroupUnschedulable, "1 replica(s) cannot be scheduled", corev1.EventTypeWarning},
+			},
+		},
+		{
+			name:       "a new unschedulable count during a rolling update does not repeat the update event",
+			previous:   []metav1.Condition{updating, unschedulable(1), notDegraded},
+			conditions: []metav1.Condition{updating, unschedulable(2), notDegraded},
+			want:       []event{{GroupUnschedulable, "2 replica(s) cannot be scheduled", corev1.EventTypeWarning}},
+		},
+		{
+			name:       "an unchanged unschedulable count during a rolling update is not reported again",
+			previous:   []metav1.Condition{unschedulable(1), notDegraded},
+			conditions: []metav1.Condition{updating, unschedulable(1), notDegraded},
+			want:       []event{{updating.Reason, updating.Message, corev1.EventTypeNormal}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []event
+			for _, e := range conditionEvents(tc.previous, tc.conditions, false) {
+				got = append(got, event{e.condition.Reason, e.condition.Message, e.eventType})
+			}
+			if diff := cmp.Diff(tc.want, got, cmp.AllowUnexported(event{})); diff != "" {
+				t.Errorf("conditionEvents() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSetConditionsClearsUnschedulableReasonWhenAvailable(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	conditions := []metav1.Condition{makeCondition(leaderworkerset.LeaderWorkerSetProgressing, lws)}
+	explainUnschedulableGroups(conditions, 1)
+	lws.Status.Conditions = conditions
+
+	setConditions(lws, []metav1.Condition{makeCondition(leaderworkerset.LeaderWorkerSetAvailable, lws)})
+
+	got := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetProgressing))
+	if got == nil || got.Status != metav1.ConditionFalse {
+		t.Fatalf("Progressing condition = %#v, want False", got)
+	}
+	if got.Reason != GroupsProgressing || got.Message != "Replicas are progressing" {
+		t.Errorf("Progressing reason, message = %q, %q, want the defaults", got.Reason, got.Message)
+	}
+}
+
+func TestUpdateConditionsReportsDegradedWithoutWorkerStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Size(2).Obj()
+	leader := wrappers.MakePodWithLabels(lws.Name, "0", "0", lws.Namespace, 2)
+	leader.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	leader.Annotations[leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey] = "true"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, leader).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+	if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", int(*lws.Spec.Replicas)); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetDegraded))
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded condition = %#v, want True", condition)
+	}
+}
+
+func TestUpdateConditionsDoesNotReportDegradedReplicaAvailable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Size(1).Obj()
+	leader := wrappers.MakePodWithLabels(lws.Name, "0", "0", lws.Namespace, 1)
+	leader.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	leader.Annotations[leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey] = "true"
+	leader.Status.Phase = corev1.PodRunning
+	leader.Status.Conditions = []corev1.PodCondition{{
+		Type:   corev1.PodReady,
+		Status: corev1.ConditionTrue,
+	}}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, leader).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+	if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", int(*lws.Spec.Replicas)); err != nil {
+		t.Fatal(err)
+	}
+	available := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetAvailable))
+	if available == nil || available.Status != metav1.ConditionFalse {
+		t.Fatalf("Available condition = %#v, want False", available)
+	}
+	degraded := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetDegraded))
+	if degraded == nil || degraded.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded condition = %#v, want True", degraded)
+	}
+}
+
+func TestUpdateConditionsReportsActiveSurgeReplicaDegraded(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Size(1).Obj()
+	desired := wrappers.MakePodWithLabels(lws.Name, "0", "0", lws.Namespace, 1)
+	desired.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	desired.Status.Phase = corev1.PodRunning
+	desired.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	surge := wrappers.MakePodWithLabels(lws.Name, "1", "0", lws.Namespace, 1)
+	surge.Labels[leaderworkerset.RevisionKey] = "revision-a"
+	surge.Annotations[leaderworkerset.GroupRestartBudgetExhaustedAnnotationKey] = "true"
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, desired, surge).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+	if _, _, err := r.updateConditions(context.Background(), lws, "revision-a", int(*lws.Spec.Replicas)); err != nil {
+		t.Fatal(err)
+	}
+	degraded := apimeta.FindStatusCondition(lws.Status.Conditions, string(leaderworkerset.LeaderWorkerSetDegraded))
+	if degraded == nil || degraded.Status != metav1.ConditionTrue {
+		t.Fatalf("Degraded condition = %#v, want True", degraded)
+	}
+}
+
+func TestCleanupObsoleteGroupRestartCounts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	lws.Annotations = map[string]string{
+		leaderworkerset.GroupRestartCountsAnnotationKey: `{"old-revision/0":1,"revision-a/0":2,"revision-a/1":3}`,
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient}
+	if err := r.cleanupObsoleteGroupRestartCounts(context.Background(), lws, "revision-a"); err != nil {
+		t.Fatal(err)
+	}
+	var updated leaderworkerset.LeaderWorkerSet
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(lws), &updated); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := parseGroupRestartCounts(updated.Annotations[leaderworkerset.GroupRestartCountsAnnotationKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(counts) != 2 || counts["revision-a/0"] != 2 || counts["revision-a/1"] != 3 {
+		t.Fatalf("unexpected counts after revision cleanup: %#v", counts)
+	}
+}
+
+func TestSetConditionsAppliesMixedStatusConditions(t *testing.T) {
+	lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").Generation(1).Obj()
+	conditions := []metav1.Condition{
+		makeFalseCondition(leaderworkerset.LeaderWorkerSetProgressing, lws, "ReplicaRestartBudgetExceeded", "Automatic recovery stopped"),
+		makeCondition(leaderworkerset.LeaderWorkerSetDegraded, lws),
+	}
+	if !setConditions(lws, conditions) {
+		t.Fatal("setConditions() should report an update")
+	}
+	if len(lws.Status.Conditions) != 2 {
+		t.Fatalf("condition count = %d, want 2", len(lws.Status.Conditions))
+	}
+	if lws.Status.Conditions[0].Status != metav1.ConditionFalse || lws.Status.Conditions[1].Status != metav1.ConditionTrue {
+		t.Fatalf("unexpected conditions: %#v", lws.Status.Conditions)
+	}
+}
+
+func TestPruneScaledDownGroupRestartCounts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Obj()
+	lws.Annotations = map[string]string{
+		leaderworkerset.GroupRestartCountsAnnotationKey: `{"revision-a/0":1,"revision-a/1":2}`,
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient}
+	if err := r.pruneScaledDownGroupRestartCounts(context.Background(), lws, 1); err != nil {
+		t.Fatal(err)
+	}
+	var updated leaderworkerset.LeaderWorkerSet
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(lws), &updated); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := parseGroupRestartCounts(updated.Annotations[leaderworkerset.GroupRestartCountsAnnotationKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["revision-a/0"] != 1 {
+		t.Fatalf("unexpected counts after scale-down: %#v", counts)
+	}
+	if _, found := counts["revision-a/1"]; found {
+		t.Fatalf("scaled-down replica count was not removed: %#v", counts)
+	}
+}
+
+func TestPruneScaledDownGroupRestartCountsPreservesActiveSurgeReplica(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := leaderworkerset.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(1).Obj()
+	lws.Annotations = map[string]string{
+		leaderworkerset.GroupRestartCountsAnnotationKey: `{"revision-a/0":1,"revision-a/1":2,"revision-a/2":3}`,
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+	r := &LeaderWorkerSetReconciler{Client: fakeClient}
+	if err := r.pruneScaledDownGroupRestartCounts(context.Background(), lws, 2); err != nil {
+		t.Fatal(err)
+	}
+	var updated leaderworkerset.LeaderWorkerSet
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(lws), &updated); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := parseGroupRestartCounts(updated.Annotations[leaderworkerset.GroupRestartCountsAnnotationKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["revision-a/0"] != 1 || counts["revision-a/1"] != 2 {
+		t.Fatalf("active replica counts were removed: %#v", counts)
+	}
+	if _, found := counts["revision-a/2"]; found {
+		t.Fatalf("inactive replica count was not removed: %#v", counts)
+	}
+}
+
+func TestCalculateContinuousReadyReplicas(t *testing.T) {
+	tests := []struct {
+		name   string
+		states []replicaState
+		want   int32
+	}{
+		{
+			name:   "no replicas",
+			states: nil,
+			want:   0,
+		},
+		{
+			name: "all replicas ready and updated",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+			},
+			want: 3,
+		},
+		{
+			name: "counting stops at the first replica that is not updated",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: false},
+				{ready: true, updated: true},
+			},
+			want: 1,
+		},
+		{
+			name: "an updated but not ready tail replica counts as zero",
+			states: []replicaState{
+				{ready: true, updated: true},
+				{ready: true, updated: true},
+				{ready: false, updated: true},
+			},
+			want: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := calculateContinuousReadyReplicas(tc.states)
+			if got != tc.want {
+				t.Fatalf("calculateContinuousReadyReplicas()=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCalculateLWSUnreadyReplicas(t *testing.T) {
+	tests := []struct {
+		name        string
+		states      []replicaState
+		lwsReplicas int32
+		want        int32
+	}{
+		{
+			name:        "all desired replicas ready and updated",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: true}},
+			lwsReplicas: 2,
+			want:        0,
+		},
+		{
+			name:        "ready but not updated replicas count as unready",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: false}},
+			lwsReplicas: 2,
+			want:        1,
+		},
+		{
+			name:        "replicas without a state yet count as unready",
+			states:      []replicaState{{ready: true, updated: true}, {ready: true, updated: false}},
+			lwsReplicas: 4,
+			want:        3,
+		},
+		{
+			name:        "surge replicas beyond the desired count are ignored",
+			states:      []replicaState{{ready: true, updated: true}, {ready: false, updated: false}, {ready: false, updated: false}},
+			lwsReplicas: 1,
+			want:        0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := calculateLWSUnreadyReplicas(tc.states, tc.lwsReplicas)
+			if got != tc.want {
+				t.Fatalf("calculateLWSUnreadyReplicas()=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRollingUpdatePartition(t *testing.T) {
+	ru := replicaState{ready: true, updated: true}
+	rn := replicaState{ready: true, updated: false}
+	nn := replicaState{ready: false, updated: false}
+
+	tests := []struct {
+		name             string
+		states           []replicaState
+		rollingStep      int32
+		currentPartition int32
+		want             int32
+	}{
+		{
+			name:             "all replicas ready and updated drops the partition to zero",
+			states:           []replicaState{ru, ru, ru, ru},
+			rollingStep:      2,
+			currentPartition: 4,
+			want:             0,
+		},
+		{
+			name:             "rollout start updates rollingStep replicas from the tail",
+			states:           []replicaState{rn, rn, rn, rn},
+			rollingStep:      1,
+			currentPartition: 4,
+			want:             3,
+		},
+		{
+			name:             "partition advances by rollingStep once the tail replica is ready and updated",
+			states:           []replicaState{rn, rn, rn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             2,
+		},
+		{
+			name:             "a not ready replica below the update window holds the partition",
+			states:           []replicaState{nn, rn, rn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             3,
+		},
+		{
+			name:             "a not ready replica at the window edge is still updated so the rollout cannot get stuck",
+			states:           []replicaState{nn, rn, nn, ru},
+			rollingStep:      1,
+			currentPartition: 3,
+			want:             2,
+		},
+		{
+			name:             "partition never moves back up",
+			states:           []replicaState{rn, rn, rn, rn},
+			rollingStep:      1,
+			currentPartition: 1,
+			want:             1,
+		},
+		{
+			name:             "rollingStep larger than the replica count updates everything at once",
+			states:           []replicaState{rn, rn, rn},
+			rollingStep:      5,
+			currentPartition: 3,
+			want:             0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rollingUpdatePartition(tc.states, int32(len(tc.states)), tc.rollingStep, tc.currentPartition)
+			if got != tc.want {
+				t.Fatalf("rollingUpdatePartition()=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPodTerminationPolicyApplyConfigAndDeletion(t *testing.T) {
+	ctx := context.TODO()
+
+	t.Run("parallel policy annotates the leader pod template", func(t *testing.T) {
+		lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+			WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
+			Size(2).
+			Obj()
+		lws.Spec.PodTerminationPolicy = leaderworkerset.ParallelPodTerminationPolicy
+
+		template, err := buildLeaderPodTemplateApplyConfiguration(lws, "rev-1")
+		if err != nil {
+			t.Fatalf("buildLeaderPodTemplateApplyConfiguration() failed: %v", err)
+		}
+		if template.Annotations[leaderworkerset.PodTerminationPolicyAnnotationKey] != string(leaderworkerset.ParallelPodTerminationPolicy) {
+			t.Errorf("expected annotation %s to be %s, got %s",
+				leaderworkerset.PodTerminationPolicyAnnotationKey,
+				leaderworkerset.ParallelPodTerminationPolicy,
+				template.Annotations[leaderworkerset.PodTerminationPolicyAnnotationKey])
+		}
+	})
+
+	t.Run("sequential and empty policies do not annotate the leader pod template", func(t *testing.T) {
+		for _, policy := range []leaderworkerset.PodTerminationPolicyType{"", leaderworkerset.SequentialPodTerminationPolicy} {
+			lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+				WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
+				Size(2).
+				Obj()
+			lws.Spec.PodTerminationPolicy = policy
+
+			template, err := buildLeaderPodTemplateApplyConfiguration(lws, "rev-1")
+			if err != nil {
+				t.Fatalf("buildLeaderPodTemplateApplyConfiguration() failed for policy %q: %v", policy, err)
+			}
+			if _, ok := template.Annotations[leaderworkerset.PodTerminationPolicyAnnotationKey]; ok {
+				t.Errorf("policy %q should not set %s, got %s",
+					policy,
+					leaderworkerset.PodTerminationPolicyAnnotationKey,
+					template.Annotations[leaderworkerset.PodTerminationPolicyAnnotationKey])
+			}
+		}
+	})
+
+	t.Run("lws deletion with Parallel policy deletes worker statefulsets", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		_ = leaderworkerset.AddToScheme(scheme)
+		_ = appsv1.AddToScheme(scheme)
+		_ = corev1.AddToScheme(scheme)
+
+		now := metav1.Now()
+		lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+			WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
+			Size(2).
+			Obj()
+		lws.Finalizers = []string{"test-finalizer"}
+		lws.DeletionTimestamp = &now
+		lws.Spec.PodTerminationPolicy = leaderworkerset.ParallelPodTerminationPolicy
+		lws.UID = "lws"
+		leaders := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+			Name: lws.Name, Namespace: lws.Namespace, UID: "leaders",
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))},
+		}}
+		objects := []client.Object{lws, leaders}
+		for i := range 2 {
+			name := fmt.Sprintf("%s-%d", lws.Name, i)
+			leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: lws.Namespace, UID: types.UID(name),
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(leaders, appsv1.SchemeGroupVersion.WithKind("StatefulSet"))},
+			}}
+			workers := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: lws.Namespace, UID: types.UID(name + "-workers"),
+				Labels:          map[string]string{leaderworkerset.SetNameLabelKey: lws.Name, leaderworkerset.RoleLabelKey: leaderworkerset.RoleWorker},
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(leader, corev1.SchemeGroupVersion.WithKind("Pod"))},
+			}}
+			objects = append(objects, leader, workers)
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(objects...).
+			Build()
+
+		reconciler := NewLeaderWorkerSetReconciler(fakeClient, scheme, events.NewFakeRecorder(10), nil)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}})
+		if err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+
+		var stsList appsv1.StatefulSetList
+		if err := fakeClient.List(ctx, &stsList, client.InNamespace("default"), client.MatchingLabels{leaderworkerset.RoleLabelKey: leaderworkerset.RoleWorker}); err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		if len(stsList.Items) != 0 {
+			t.Errorf("expected 0 worker statefulsets after parallel deletion, got %d", len(stsList.Items))
+		}
+	})
+
+	t.Run("lws deletion with Sequential policy does not delete worker statefulsets directly", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		_ = leaderworkerset.AddToScheme(scheme)
+		_ = appsv1.AddToScheme(scheme)
+		_ = corev1.AddToScheme(scheme)
+
+		now := metav1.Now()
+		lws := wrappers.BuildBasicLeaderWorkerSet("test-sample", "default").
+			WorkerTemplateSpec(wrappers.MakeWorkerPodSpec()).
+			Size(2).
+			Obj()
+		lws.Finalizers = []string{"test-finalizer"}
+		lws.DeletionTimestamp = &now
+		lws.Spec.PodTerminationPolicy = leaderworkerset.SequentialPodTerminationPolicy
+
+		workerSts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-sample-0",
+				Namespace: "default",
+				Labels: map[string]string{
+					leaderworkerset.SetNameLabelKey: "test-sample",
+					leaderworkerset.RoleLabelKey:    leaderworkerset.RoleWorker,
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(lws, workerSts).
+			Build()
+
+		reconciler := NewLeaderWorkerSetReconciler(fakeClient, scheme, events.NewFakeRecorder(10), nil)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: lws.Name, Namespace: lws.Namespace}})
+		if err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+
+		var stsList appsv1.StatefulSetList
+		if err := fakeClient.List(ctx, &stsList, client.InNamespace("default")); err != nil {
+			t.Fatalf("List() error = %v", err)
+		}
+		if len(stsList.Items) != 1 {
+			t.Errorf("expected worker statefulset to be retained under Sequential policy, got %d", len(stsList.Items))
+		}
+	})
 }

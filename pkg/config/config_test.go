@@ -35,10 +35,11 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	configapi "sigs.k8s.io/lws/api/config/v1alpha1"
+	configapi "sigs.k8s.io/lws/api/config/v1"
+	configapiv1alpha1 "sigs.k8s.io/lws/api/config/v1alpha1"
 )
 
 const (
@@ -53,12 +54,16 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	err = configapiv1alpha1.AddToScheme(testScheme)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tmpDir := t.TempDir()
 
 	ctrlManagerConfigSpecOverWriteConfig := filepath.Join(tmpDir, "ctrl-manager-config-spec-overwrite.yaml")
 	if err := os.WriteFile(ctrlManagerConfigSpecOverWriteConfig, []byte(`
-apiVersion: config.lws.x-k8s.io/v1alpha1
+apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 health:
   healthProbeBindAddress: :38081
@@ -76,7 +81,7 @@ webhook:
 
 	certOverWriteConfig := filepath.Join(tmpDir, "cert-overwrite.yaml")
 	if err := os.WriteFile(certOverWriteConfig, []byte(`
-apiVersion: config.lws.x-k8s.io/v1alpha1
+apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 health:
   healthProbeBindAddress: :8081
@@ -97,7 +102,7 @@ internalCertManagement:
 
 	disableCertOverWriteConfig := filepath.Join(tmpDir, "disable-cert-overwrite.yaml")
 	if err := os.WriteFile(disableCertOverWriteConfig, []byte(`
-apiVersion: config.lws.x-k8s.io/v1alpha1
+apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 health:
   healthProbeBindAddress: :8081
@@ -116,7 +121,7 @@ internalCertManagement:
 
 	leaderElectionDisabledConfig := filepath.Join(tmpDir, "leaderElection-disabled.yaml")
 	if err := os.WriteFile(leaderElectionDisabledConfig, []byte(`
-apiVersion: config.lws.x-k8s.io/v1alpha1
+apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 health:
   healthProbeBindAddress: :8081
@@ -132,6 +137,26 @@ webhook:
 
 	clientConnectionConfig := filepath.Join(tmpDir, "clientConnection.yaml")
 	if err := os.WriteFile(clientConnectionConfig, []byte(`
+apiVersion: config.lws.x-k8s.io/v1
+kind: Configuration
+health:
+  healthProbeBindAddress: :8081
+metrics:
+  bindAddress: :8443
+leaderElection:
+  leaderElect: true
+  resourceName: b8b2488c.x-k8s.io
+webhook:
+  port: 9443
+clientConnection:
+  qps: 50
+  burst: 100
+`), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	v1alpha1Config := filepath.Join(tmpDir, "v1alpha1-config.yaml")
+	if err := os.WriteFile(v1alpha1Config, []byte(`
 apiVersion: config.lws.x-k8s.io/v1alpha1
 kind: Configuration
 health:
@@ -152,7 +177,7 @@ clientConnection:
 
 	invalidConfig := filepath.Join(tmpDir, "invalid-config.yaml")
 	if err := os.WriteFile(invalidConfig, []byte(`
-apiVersion: config.lws.x-k8s.io/v1alpha1
+apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 invalidField: invalidValue
 health:
@@ -171,12 +196,9 @@ webhook:
 	// defaultControlOptions no longer includes WebhookServer because Load() does not
 	// set it anymore. WebhookServer is now set by AddWebhookSettingsTo() after TLS parsing.
 	defaultControlOptions := ctrl.Options{
-		HealthProbeBindAddress: configapi.DefaultHealthProbeBindAddress,
-		ReadinessEndpointName:  configapi.DefaultReadinessEndpoint,
-		LivenessEndpointName:   configapi.DefaultLivenessEndpoint,
-		Metrics: metricsserver.Options{
-			BindAddress: configapi.DefaultMetricsBindAddress,
-		},
+		HealthProbeBindAddress:     configapi.DefaultHealthProbeBindAddress,
+		ReadinessEndpointName:      configapi.DefaultReadinessEndpoint,
+		LivenessEndpointName:       configapi.DefaultLivenessEndpoint,
 		LeaderElection:             true,
 		LeaderElectionID:           configapi.DefaultLeaderElectionID,
 		LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
@@ -198,12 +220,14 @@ webhook:
 		cmpopts.IgnoreUnexported(net.ListenConfig{}),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Scheme", "Logger"),
 		cmpopts.IgnoreFields(ctrl.Options{}, "Controller", "Logger"),
+		// client.Options.Log holds a real logr.Logger with an unexported sink.
+		cmpopts.IgnoreFields(ctrlclient.Options{}, "Log"),
 	}
 
 	// Ignore the controller manager section since it's side effect is checked against
 	// the content of  the resulting options
 	configCmpOpts := []cmp.Option{
-		cmpopts.IgnoreFields(configapi.Configuration{}, "ControllerManager"),
+		cmpopts.IgnoreFields(configapi.Configuration{}, "TypeMeta", "ControllerManager"),
 	}
 
 	defaultClientConnection := &configapi.ClientConnection{
@@ -226,12 +250,9 @@ webhook:
 				ClientConnection:       defaultClientConnection,
 			},
 			wantOptions: ctrl.Options{
-				HealthProbeBindAddress: configapi.DefaultHealthProbeBindAddress,
-				ReadinessEndpointName:  configapi.DefaultReadinessEndpoint,
-				LivenessEndpointName:   configapi.DefaultLivenessEndpoint,
-				Metrics: metricsserver.Options{
-					BindAddress: configapi.DefaultMetricsBindAddress,
-				},
+				HealthProbeBindAddress:     configapi.DefaultHealthProbeBindAddress,
+				ReadinessEndpointName:      configapi.DefaultReadinessEndpoint,
+				LivenessEndpointName:       configapi.DefaultLivenessEndpoint,
 				LeaderElection:             true,
 				LeaderElectionID:           configapi.DefaultLeaderElectionID,
 				LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
@@ -263,12 +284,9 @@ webhook:
 				ClientConnection:       defaultClientConnection,
 			},
 			wantOptions: ctrl.Options{
-				HealthProbeBindAddress: ":38081",
-				ReadinessEndpointName:  "test",
-				LivenessEndpointName:   configapi.DefaultLivenessEndpoint,
-				Metrics: metricsserver.Options{
-					BindAddress: ":38080",
-				},
+				HealthProbeBindAddress:     ":38081",
+				ReadinessEndpointName:      "test",
+				LivenessEndpointName:       configapi.DefaultLivenessEndpoint,
 				LeaderElection:             true,
 				LeaderElectionID:           "test-id",
 				LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
@@ -323,12 +341,9 @@ webhook:
 				ClientConnection:       defaultClientConnection,
 			},
 			wantOptions: ctrl.Options{
-				HealthProbeBindAddress: configapi.DefaultHealthProbeBindAddress,
-				ReadinessEndpointName:  configapi.DefaultReadinessEndpoint,
-				LivenessEndpointName:   configapi.DefaultLivenessEndpoint,
-				Metrics: metricsserver.Options{
-					BindAddress: configapi.DefaultMetricsBindAddress,
-				},
+				HealthProbeBindAddress:     configapi.DefaultHealthProbeBindAddress,
+				ReadinessEndpointName:      configapi.DefaultReadinessEndpoint,
+				LivenessEndpointName:       configapi.DefaultLivenessEndpoint,
 				LeaderElectionID:           configapi.DefaultLeaderElectionID,
 				LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
 				LeaseDuration:              ptr.To(defaultLeaderElectionLeaseDuration),
@@ -342,6 +357,22 @@ webhook:
 		{
 			name:       "clientConnection config",
 			configFile: clientConnectionConfig,
+			wantConfiguration: configapi.Configuration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: configapi.GroupVersion.String(),
+					Kind:       "Configuration",
+				},
+				InternalCertManagement: enableDefaultInternalCertManagement,
+				ClientConnection: &configapi.ClientConnection{
+					QPS:   ptr.To[float32](50),
+					Burst: ptr.To[int32](100),
+				},
+			},
+			wantOptions: defaultControlOptions,
+		},
+		{
+			name:       "v1alpha1 backward compatibility config",
+			configFile: v1alpha1Config,
 			wantConfiguration: configapi.Configuration{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: configapi.GroupVersion.String(),
@@ -383,6 +414,39 @@ webhook:
 				}
 			}
 		})
+	}
+}
+
+func TestLoadAppliesV1DefaultsAfterConversion(t *testing.T) {
+	testScheme := runtime.NewScheme()
+	if err := configapi.AddToScheme(testScheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := configapiv1alpha1.AddToScheme(testScheme); err != nil {
+		t.Fatal(err)
+	}
+
+	const v1DefaultHost = "v1-default-applied"
+	testScheme.AddTypeDefaultingFunc(&configapi.Configuration{}, func(obj interface{}) {
+		cfg := obj.(*configapi.Configuration)
+		configapi.SetDefaults_Configuration(cfg)
+		cfg.Webhook.Host = v1DefaultHost
+	})
+
+	configFile := filepath.Join(t.TempDir(), "v1alpha1-config.yaml")
+	if err := os.WriteFile(configFile, []byte(`
+apiVersion: config.lws.x-k8s.io/v1alpha1
+kind: Configuration
+`), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cfg, err := Load(testScheme, configFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Webhook.Host != v1DefaultHost {
+		t.Errorf("Load() webhook host = %q, want v1 default %q", cfg.Webhook.Host, v1DefaultHost)
 	}
 }
 
@@ -533,7 +597,7 @@ func TestEncode(t *testing.T) {
 			scheme: testScheme,
 			cfg:    &configapi.Configuration{},
 			wantResult: map[string]any{
-				"apiVersion": "config.lws.x-k8s.io/v1alpha1",
+				"apiVersion": "config.lws.x-k8s.io/v1",
 				"kind":       "Configuration",
 				"health":     map[string]any{},
 				"metrics":    map[string]any{},
@@ -545,7 +609,7 @@ func TestEncode(t *testing.T) {
 			scheme: testScheme,
 			cfg:    defaultConfig,
 			wantResult: map[string]any{
-				"apiVersion": "config.lws.x-k8s.io/v1alpha1",
+				"apiVersion": "config.lws.x-k8s.io/v1",
 				"kind":       "Configuration",
 				"webhook": map[string]any{
 					"port":    int64(configapi.DefaultWebhookPort),

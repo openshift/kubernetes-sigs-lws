@@ -1,7 +1,7 @@
 ---
 title: "Contribution Guidelines"
 linkTitle: "Contribution Guidelines"
-weight: 9
+weight: 100
 description: >
   How to contribute to LWS
 ---
@@ -21,6 +21,22 @@ If your repo has certain guidelines for contribution, put them here ahead of the
 - [Contributor License Agreement](https://git.k8s.io/community/CLA.md) Kubernetes projects require that you sign a Contributor License Agreement (CLA) before we can accept your pull requests
 - [Kubernetes Contributor Guide](https://git.k8s.io/community/contributors/guide) - Main contributor documentation, or you can just jump directly to the [contributing section](https://git.k8s.io/community/contributors/guide#contributing)
 - [Contributor Cheat Sheet](https://git.k8s.io/community/contributors/guide/contributor-cheatsheet) - Common resources for existing developers
+
+## Documentation examples
+
+Concept pages do not embed YAML manifests directly. Put the manifest under
+`site/static/examples/<api>/<topic>/` and render it with the `include`
+shortcode:
+
+```
+{{</* include file="examples/leaderworkerset/failure-handling/none.yaml" lang="yaml" */>}}
+```
+
+The site build fails if the referenced file is missing. Every manifest under
+`site/static/examples`, `docs/examples` and `config/samples` is decoded with
+strict field checking and run through the admission webhooks by
+`test/examples`, which runs as part of `make test`, so a snippet cannot drift
+from the API without failing CI.
 
 ## Mentorship
 

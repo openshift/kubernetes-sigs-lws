@@ -1,0 +1,1106 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package schedulerprovider
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/dump"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
+	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	podutils "sigs.k8s.io/lws/pkg/utils/pod"
+)
+
+const (
+	// Kubernetes identifies the upstream scheduling.k8s.io provider.
+	Kubernetes ProviderType = "kubernetes"
+
+	// WorkloadSchedulingAnnotationKey is set on managed pod templates by the LWS
+	// controller. The pod webhook reads it to choose a PodGroup name.
+	WorkloadSchedulingAnnotationKey = "leaderworkerset.sigs.k8s.io/workload-aware-scheduling"
+	// WorkloadNameAnnotationKey is set on managed pod templates by the LWS
+	// controller. The pod webhook uses it because the admission request has no LWS object.
+	// On Ordinal leader pods in replica and role modes the pod webhook appends
+	// a group incarnation to it, which the pod controller copies onto the
+	// worker statefulset template, see GroupWorkloadName.
+	WorkloadNameAnnotationKey = "leaderworkerset.sigs.k8s.io/workload-name"
+	// SchedulingLevelLabelKey is set on created PodGroups by the kubernetes provider.
+	SchedulingLevelLabelKey = "leaderworkerset.sigs.k8s.io/scheduling-level"
+	// PodGroupRoleLabelKey is set on role-mode PodGroups by the kubernetes provider.
+	PodGroupRoleLabelKey = "leaderworkerset.sigs.k8s.io/role"
+
+	workloadControllerUIDIndex  = "leaderworkerset.sigs.k8s.io/workload-controller-uid"
+	podSchedulingGroupNameIndex = "leaderworkerset.sigs.k8s.io/pod-scheduling-group-name"
+	// groupIncarnationSeparator separates the group incarnation from the
+	// workload name. Workload names never contain it, LeaderWorkerSet names
+	// are DNS labels.
+	groupIncarnationSeparator = "."
+	// groupIncarnationLength matches the random suffix of generated object names.
+	groupIncarnationLength = 5
+)
+
+// SetupKubernetesIndexes registers cache indexes used by the Kubernetes provider.
+func SetupKubernetesIndexes(indexer client.FieldIndexer) error {
+	if err := indexer.IndexField(context.Background(), &schedulingv1beta1.Workload{}, workloadControllerUIDIndex, workloadControllerUIDIndexValues); err != nil {
+		return err
+	}
+	return indexer.IndexField(context.Background(), &corev1.Pod{}, podSchedulingGroupNameIndex, podSchedulingGroupNameIndexValues)
+}
+
+func workloadControllerUIDIndexValues(raw client.Object) []string {
+	owner := metav1.GetControllerOf(raw)
+	if owner == nil || owner.UID == "" {
+		return nil
+	}
+	return []string{string(owner.UID)}
+}
+
+func podSchedulingGroupNameIndexValues(raw client.Object) []string {
+	pod, ok := raw.(*corev1.Pod)
+	if !ok || pod.Spec.SchedulingGroup == nil || pod.Spec.SchedulingGroup.PodGroupName == nil {
+		return nil
+	}
+	return []string{*pod.Spec.SchedulingGroup.PodGroupName}
+}
+
+// KubernetesWorkloadName returns the UID-qualified Workload name.
+func KubernetesWorkloadName(lws *leaderworkerset.LeaderWorkerSet) string {
+	hasher := fnv.New32a()
+	_, _ = fmt.Fprintf(hasher, "%v", dump.ForHash(lws.UID))
+	hash := utilrand.SafeEncodeString(fmt.Sprint(hasher.Sum32()))
+	maxPrefixLen := validation.DNS1123SubdomainMaxLength - len(hash) - 1
+	prefix := lws.Name
+	if len(prefix) > maxPrefixLen {
+		prefix = prefix[:maxPrefixLen]
+	}
+	return prefix + "-" + hash
+}
+
+func kubernetesRuntimeName(workloadName string, parts ...string) string {
+	separator := strings.LastIndexByte(workloadName, '-')
+	prefix := workloadName
+	identity := ""
+	if separator > 0 {
+		prefix = workloadName[:separator]
+		identity = workloadName[separator+1:]
+	}
+	allParts := make([]string, 0, len(parts)+1)
+	if identity != "" {
+		allParts = append(allParts, identity)
+	}
+	allParts = append(allParts, parts...)
+	suffix := strings.Join(allParts, "-")
+	maxPrefixLen := validation.DNS1123SubdomainMaxLength - len(suffix) - 1
+	if len(prefix) > maxPrefixLen {
+		prefix = prefix[:maxPrefixLen]
+	}
+	return prefix + "-" + suffix
+}
+
+// KubernetesLWSGroupName returns the UID-qualified whole-LWS PodGroup name.
+func KubernetesLWSGroupName(lws *leaderworkerset.LeaderWorkerSet) string {
+	return kubernetesRuntimeName(KubernetesWorkloadName(lws), "lws")
+}
+
+// KubernetesPodGroupName returns a UID-qualified replica PodGroup name derived
+// from the plain workload name, KubernetesWorkloadName. It is the PodGroup name
+// of a Hash group, and of an Ordinal group whose leader pod carries no group
+// incarnation, such as one admitted before group incarnations were
+// introduced. An Ordinal leader pod admitted by the pod webhook of this version
+// carries one, so derive the names of its PodGroups from
+// GroupWorkloadName(lws, leaderPod) instead.
+func KubernetesPodGroupName(lws *leaderworkerset.LeaderWorkerSet, groupIndex, revision string) string {
+	return kubernetesRuntimeName(KubernetesWorkloadName(lws), groupIndex, revision)
+}
+
+// KubernetesRolePodGroupName returns a UID-qualified role PodGroup name derived
+// from the plain workload name. Like KubernetesPodGroupName, it does not match
+// the PodGroups of an Ordinal leader pod that carries a group incarnation, see
+// GroupWorkloadName.
+func KubernetesRolePodGroupName(lws *leaderworkerset.LeaderWorkerSet, groupIndex, role, revision string) string {
+	return kubernetesRuntimeName(KubernetesWorkloadName(lws), groupIndex, role, revision)
+}
+
+// GroupWorkloadName returns the WorkloadNameAnnotationKey value of the pods in
+// the group of leaderPod, from which the names of the group's PodGroups are
+// derived.
+//
+// The pod webhook gives every Ordinal leader pod in replica and role modes a
+// group incarnation of its own: a random suffix of the workload name. The
+// statefulset controller recreates a leader with the same name, group index
+// and revision, so without it the new leader would reuse a PodGroup that
+// cleanup may already be deleting. The PodGroup protection finalizer then
+// holds that PodGroup for as long as the gated leader references it, and the
+// leader is never admitted. The worker statefulset template carries the
+// leader's workload name, so the workers join the same PodGroups whichever LWS
+// version admits them.
+//
+// Hash leaders, whose group key is already drawn per leader pod, and leader
+// pods admitted before group incarnations were introduced keep
+// KubernetesWorkloadName.
+func GroupWorkloadName(lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod) string {
+	workloadName := KubernetesWorkloadName(lws)
+	incarnation, found := strings.CutPrefix(leaderPod.Annotations[WorkloadNameAnnotationKey], workloadName+groupIncarnationSeparator)
+	if found && isGroupIncarnation(incarnation) {
+		return workloadName + groupIncarnationSeparator + incarnation
+	}
+	return workloadName
+}
+
+// isGroupIncarnation reports whether s has the form of a group incarnation
+// drawn by the pod webhook.
+func isGroupIncarnation(s string) bool {
+	if len(s) != groupIncarnationLength {
+		return false
+	}
+	for _, c := range s {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// KubernetesProvider manages upstream Workload and PodGroup resources.
+type KubernetesProvider struct {
+	client client.Client
+}
+
+func NewKubernetesProvider(c client.Client) *KubernetesProvider {
+	return &KubernetesProvider{client: c}
+}
+
+// ReconcileScheduling creates controller-level scheduling objects before pods:
+//   - find or create the Workload (or look up a parent-owned delegated Workload)
+//   - create or update the whole-LWS PodGroup when in whole-LWS mode
+//   - require a parent CompositePodGroup to exist when that annotation is set
+//   - delete unused LWS-owned PodGroups that no longer have member pods
+//
+// In replica and role modes (both Ordinal and Hash groupIdentity), per-replica
+// PodGroups are materialized by CreatePodGroupIfNotExists while each leader pod
+// is still held by GroupReplacementSchedulingGate. Cleanup keeps every group
+// whose leader pod is active or that still has member pods.
+func (p *KubernetesProvider) ReconcileScheduling(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, replicas int32, revision string) error {
+	if lws.Spec.Scheduling == nil {
+		return nil
+	}
+
+	persisted, err := p.reconcileWorkload(ctx, lws)
+	if err != nil {
+		return err
+	}
+
+	groups, err := desiredPodGroups(lws, replicas, revision)
+	if err != nil {
+		return NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+	}
+	for i := range groups {
+		if groups[i].templateName != lwsWorkloadTemplateName {
+			continue
+		}
+		minCount, err := p.wholeLWSGangMinCount(ctx, lws, groups[i].name)
+		if err != nil {
+			return NewReconcileError(ReasonPodGroupCreateFailed, err)
+		}
+		groups[i].gangMinCount = ptr.To(minCount)
+	}
+	desiredGroups := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		desiredGroups[group.name] = struct{}{}
+	}
+	if err := p.ensurePodGroups(ctx, lws, persisted, groups); err != nil {
+		return err
+	}
+
+	if err := p.cleanupUnusedPodGroups(ctx, lws, desiredGroups); err != nil {
+		return NewReconcileError(ReasonPodGroupCleanupBlocked, err)
+	}
+	return nil
+}
+
+// ensurePodGroups materializes the given PodGroups from the persisted Workload
+// templates and reconciles the mutable fields of the ones that already exist.
+func (p *KubernetesProvider) ensurePodGroups(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, persisted *schedulingv1beta1.Workload, groups []desiredPodGroup) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	materializer := workloadbuilder.NewBuilderFromExistingWorkload(persisted, workloadbuilder.BuildOptions{
+		Owner: metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet")),
+	})
+	// TODO(phase2): honor ParentCompositePodGroupAnnotation by reading the named
+	// CompositePodGroup (API reader or dedicated RBAC, not the cached client)
+	// and setting PodGroup.Spec.ParentCompositePodGroupName. A cached Get
+	// without list/watch stalls the reconciler.
+	parentTemplateName := lws.Annotations[GroupTemplateNameAnnotation]
+	delegated := parentTemplateName != ""
+	for _, group := range groups {
+		name := group.name
+		if delegated {
+			group.templateName = parentTemplateName
+		}
+		podGroup, err := materializer.NewPodGroup(name, group.templateName)
+		if err != nil {
+			return NewReconcileError(ReasonInvalidSchedulingConfiguration, fmt.Errorf("materialize PodGroup %q: %w", name, err))
+		}
+		minCount := minCountImmutable
+		if group.allowMinCountUpdate {
+			minCount = minCountUpdate
+		}
+		if gang := podGroup.Spec.SchedulingPolicy.Gang; gang != nil && group.gangMinCount != nil {
+			if delegated {
+				// The parent owns the template and its minimum, which can only
+				// follow one size. After a size change, the PodGroups of groups
+				// the rollout has not replaced yet keep the minimum they were
+				// created with rather than failing every reconcile of their
+				// leader with drift.
+				if minCount == minCountImmutable {
+					minCount = minCountKeep
+				}
+			} else {
+				gang.MinCount = *group.gangMinCount
+				// Also correct an existing PodGroup that was materialized from the
+				// template of another size, as earlier versions did after a size change.
+				minCount = minCountUpdate
+			}
+		}
+		podGroup.TypeMeta = metav1.TypeMeta{
+			APIVersion: schedulingv1beta1.SchemeGroupVersion.String(),
+			Kind:       "PodGroup",
+		}
+		podGroup.Labels = group.labels
+		if !delegated {
+			attachWorkloadOwnerReference(podGroup, persisted)
+		}
+		existing := &schedulingv1beta1.PodGroup{}
+		key := types.NamespacedName{Namespace: podGroup.Namespace, Name: name}
+		if err := p.client.Get(ctx, key, existing); err == nil {
+			if !existing.DeletionTimestamp.IsZero() {
+				return NewReconcileError(ReasonPodGroupCleanupBlocked, fmt.Errorf("PodGroup %s is still terminating", key))
+			}
+			if err := updateMutablePodGroupFields(ctx, p.client, existing, podGroup, minCount); err != nil {
+				return NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return workloadAPIError(ReasonPodGroupCreateFailed, fmt.Errorf("get PodGroup %s: %w", key, err))
+		} else if err := p.client.Create(ctx, podGroup); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return workloadAPIError(ReasonPodGroupCreateFailed, fmt.Errorf("create PodGroup %s/%s: %w", podGroup.Namespace, name, err))
+			}
+			if err := p.client.Get(ctx, key, existing); err != nil {
+				return workloadAPIError(ReasonPodGroupCreateFailed, fmt.Errorf("get existing PodGroup %s: %w", key, err))
+			}
+			if !existing.DeletionTimestamp.IsZero() {
+				return NewReconcileError(ReasonPodGroupCleanupBlocked, fmt.Errorf("PodGroup %s is still terminating", key))
+			}
+			if err := updateMutablePodGroupFields(ctx, p.client, existing, podGroup, minCount); err != nil {
+				return NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+			}
+		}
+	}
+	return nil
+}
+
+type desiredPodGroup struct {
+	name                string
+	templateName        string
+	labels              map[string]string
+	allowMinCountUpdate bool
+	// gangMinCount, when set, replaces the gang minCount of the template, which
+	// follows the current size, with the membership of the groups the PodGroup
+	// covers. For delegated Workloads, whose templates belong to the parent,
+	// the template minimum is used instead, and an existing per-replica
+	// PodGroup keeps its minimum.
+	gangMinCount *int32
+}
+
+func desiredPodGroups(lws *leaderworkerset.LeaderWorkerSet, replicas int32, _ string) ([]desiredPodGroup, error) {
+	mode, err := SchedulingModeFor(lws)
+	if err != nil {
+		return nil, err
+	}
+
+	switch mode {
+	case SchedulingModeLWS:
+		if replicas == 0 {
+			return nil, nil
+		}
+		return []desiredPodGroup{{
+			name:                kubernetesRuntimeName(KubernetesWorkloadName(lws), "lws"),
+			templateName:        lwsWorkloadTemplateName,
+			labels:              basePodGroupLabels(lws, mode),
+			allowMinCountUpdate: true,
+		}}, nil
+	case SchedulingModeReplica, SchedulingModeRole:
+		// Per-replica and role PodGroups are materialized per leader pod by
+		// CreatePodGroupIfNotExists while the leader is still scheduling-gated.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported scheduling mode %q", mode)
+	}
+}
+
+// wholeLWSGangMinCount returns the gang minimum of the whole-LWS PodGroup
+// podGroupName: the pods in the groups of the replicas, see
+// wholeLWSMembership. Only groups whose leader pod is a member of the PodGroup
+// count, which leaves out the pods of a deleted LWS of the same name. Leader
+// pods that are terminating count too, because the scheduler counts the members
+// of their group until they are deleted.
+func (p *KubernetesProvider) wholeLWSGangMinCount(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, podGroupName string) (int32, error) {
+	leaders := &corev1.PodList{}
+	if err := p.client.List(ctx, leaders, client.InNamespace(lws.Namespace), client.MatchingLabels{
+		leaderworkerset.SetNameLabelKey:     lws.Name,
+		leaderworkerset.WorkerIndexLabelKey: "0",
+	}); err != nil {
+		return 0, fmt.Errorf("list leader pods: %w", err)
+	}
+	groupSizes := make([]int32, 0, len(leaders.Items))
+	for i := range leaders.Items {
+		leader := &leaders.Items[i]
+		if ref := leader.Spec.SchedulingGroup; ref == nil || ptr.Deref(ref.PodGroupName, "") != podGroupName {
+			continue
+		}
+		groupSizes = append(groupSizes, groupSize(ctx, lws, leader))
+	}
+	return wholeLWSMembership(ptr.Deref(lws.Spec.Replicas, 1), ptr.Deref(lws.Spec.LeaderWorkerTemplate.Size, 1), groupSizes), nil
+}
+
+// wholeLWSMembership returns the number of pods in the groups of the replicas
+// of a whole-LWS gang, given the sizes of the existing groups. Every group
+// keeps the size of the revision its leader pod was created from, so after a
+// size increase the LWS has fewer than replicas * size pods until the rollout
+// has replaced all groups of the old size. Against the replicas * size of the
+// Workload template, the scheduler would never admit the replacement groups
+// and the rollout would stall.
+//
+// Every replica counts with the size of an existing group, the smallest first,
+// since surge and scaled down groups go away. A replica without a group counts
+// with the smallest group size, or with size if that is smaller. The result is
+// at least 1 and at most replicas * size, the template minimum, and is lower
+// only while a group is smaller than size.
+//
+// A replica without a group may be recreated with either size: the current
+// one, or the previous one when a partition keeps it on the old revision.
+// Counting it with the larger size could leave the minimum out of reach for as
+// long as the partition holds, so it counts with the smaller one. When its
+// leader pod then shows up with the larger size, the minimum is too low until
+// the reconcile that the leader pod creation triggers raises it, and the
+// scheduler could admit that group with only part of its pods. The window is
+// short, since the leader is still held by the group replacement scheduling
+// gate and its workers are created afterwards, and the gang stays reachable.
+func wholeLWSMembership(replicas, size int32, groupSizes []int32) int32 {
+	slices.Sort(groupSizes)
+	pending := size
+	if len(groupSizes) > 0 {
+		pending = min(pending, groupSizes[0])
+	}
+	var members int32
+	for i := range replicas {
+		if int(i) < len(groupSizes) {
+			members += groupSizes[i]
+		} else {
+			members += pending
+		}
+	}
+	return max(1, min(members, replicas*size))
+}
+
+func basePodGroupLabels(lws *leaderworkerset.LeaderWorkerSet, mode SchedulingMode) map[string]string {
+	return map[string]string{
+		leaderworkerset.SetNameLabelKey: lws.Name,
+		SchedulingLevelLabelKey:         string(mode),
+	}
+}
+
+// replicaPodGroups returns the PodGroups of a single replica: one in replica
+// mode, a leader and a worker one in role mode. workloadName is the workload
+// name of the replica's pods, see GroupWorkloadName. groupIndex is the value of
+// the group index label, an ordinal with groupIdentity Ordinal and the group
+// key with groupIdentity Hash.
+func replicaPodGroups(lws *leaderworkerset.LeaderWorkerSet, mode SchedulingMode, workloadName, groupIndex, revision string) []desiredPodGroup {
+	if mode == SchedulingModeReplica {
+		labels := basePodGroupLabels(lws, mode)
+		labels[leaderworkerset.GroupIndexLabelKey] = groupIndex
+		labels[leaderworkerset.RevisionKey] = revision
+		return []desiredPodGroup{{
+			name:         kubernetesRuntimeName(workloadName, groupIndex, revision),
+			templateName: replicaWorkloadTemplateName,
+			labels:       labels,
+		}}
+	}
+	groups := make([]desiredPodGroup, 0, 2)
+	for _, role := range []string{leaderWorkloadTemplateName, workerWorkloadTemplateName} {
+		labels := basePodGroupLabels(lws, mode)
+		labels[leaderworkerset.GroupIndexLabelKey] = groupIndex
+		labels[leaderworkerset.RevisionKey] = revision
+		labels[PodGroupRoleLabelKey] = role
+		groups = append(groups, desiredPodGroup{
+			name:         kubernetesRuntimeName(workloadName, groupIndex, role, revision),
+			templateName: role,
+			labels:       labels,
+		})
+	}
+	return groups
+}
+
+// minCountPolicy says how updateMutablePodGroupFields treats an existing
+// PodGroup whose gang minCount differs from the desired one.
+type minCountPolicy int
+
+const (
+	// minCountImmutable reports the difference as drift, like any other spec
+	// field.
+	minCountImmutable minCountPolicy = iota
+	// minCountUpdate updates the existing PodGroup to the desired minCount.
+	minCountUpdate
+	// minCountKeep leaves the existing minCount as it is.
+	minCountKeep
+)
+
+func updateMutablePodGroupFields(ctx context.Context, c client.Client, current, desired *schedulingv1beta1.PodGroup, minCount minCountPolicy) error {
+	currentOwner := metav1.GetControllerOf(current)
+	desiredOwner := metav1.GetControllerOf(desired)
+	ownerMatches := controllerReferencesEqual(currentOwner, desiredOwner)
+	currentSpec := current.Spec.DeepCopy()
+	desiredSpec := desired.Spec.DeepCopy()
+	desiredSpec.Priority = currentSpec.Priority
+	desiredSpec.PreemptionPolicy = currentSpec.PreemptionPolicy
+	defaultDisruptionMode := func(spec *schedulingv1beta1.PodGroupSpec) {
+		if spec.DisruptionMode == nil {
+			spec.DisruptionMode = &schedulingv1beta1.DisruptionMode{
+				Single: &schedulingv1beta1.SingleDisruptionMode{},
+			}
+		}
+	}
+	defaultDisruptionMode(currentSpec)
+	defaultDisruptionMode(desiredSpec)
+	var changed bool
+	if minCount != minCountImmutable && currentSpec.SchedulingPolicy.Gang != nil && desiredSpec.SchedulingPolicy.Gang != nil {
+		if minCount == minCountUpdate && currentSpec.SchedulingPolicy.Gang.MinCount != desiredSpec.SchedulingPolicy.Gang.MinCount {
+			current.Spec.SchedulingPolicy.Gang.MinCount = desired.Spec.SchedulingPolicy.Gang.MinCount
+			changed = true
+		}
+		currentSpec.SchedulingPolicy.Gang.MinCount = desiredSpec.SchedulingPolicy.Gang.MinCount
+	}
+	if !ownerMatches || !reflect.DeepEqual(currentSpec, desiredSpec) {
+		return fmt.Errorf("PodGroup %s/%s has immutable scheduling configuration drift", current.Namespace, current.Name)
+	}
+	if current.Labels == nil {
+		current.Labels = make(map[string]string, len(desired.Labels))
+	}
+	for key, value := range desired.Labels {
+		if current.Labels[key] != value {
+			current.Labels[key] = value
+			changed = true
+		}
+	}
+	if ensureWorkloadOwnerReference(current, desired) {
+		changed = true
+	}
+	if changed {
+		if err := c.Update(ctx, current); err != nil {
+			return fmt.Errorf("update mutable PodGroup fields for %s/%s: %w", current.Namespace, current.Name, err)
+		}
+	}
+	return nil
+}
+
+func attachWorkloadOwnerReference(podGroup *schedulingv1beta1.PodGroup, workload *schedulingv1beta1.Workload) {
+	if workload == nil || workload.UID == "" {
+		return
+	}
+	desired := metav1.OwnerReference{
+		APIVersion: schedulingv1beta1.SchemeGroupVersion.String(),
+		Kind:       "Workload",
+		Name:       workload.Name,
+		UID:        workload.UID,
+		Controller: ptr.To(false),
+	}
+	ensureOwnerReference(&podGroup.ObjectMeta, desired)
+}
+
+func ensureWorkloadOwnerReference(current, desired *schedulingv1beta1.PodGroup) bool {
+	want := workloadOwnerReference(desired)
+	if want == nil {
+		return false
+	}
+	return ensureOwnerReference(&current.ObjectMeta, *want)
+}
+
+func workloadOwnerReference(obj metav1.Object) *metav1.OwnerReference {
+	for i := range obj.GetOwnerReferences() {
+		ref := &obj.GetOwnerReferences()[i]
+		if ref.Kind == "Workload" && (ref.Controller == nil || !*ref.Controller) {
+			return ref.DeepCopy()
+		}
+	}
+	return nil
+}
+
+func ensureOwnerReference(meta *metav1.ObjectMeta, desired metav1.OwnerReference) bool {
+	refs := meta.OwnerReferences
+	for i := range refs {
+		if refs[i].Kind != desired.Kind || refs[i].APIVersion != desired.APIVersion {
+			continue
+		}
+		if refs[i].Name == desired.Name && refs[i].UID == desired.UID &&
+			ptr.Deref(refs[i].Controller, false) == ptr.Deref(desired.Controller, false) {
+			return false
+		}
+		refs[i] = desired
+		meta.OwnerReferences = refs
+		return true
+	}
+	meta.OwnerReferences = append(meta.OwnerReferences, desired)
+	return true
+}
+
+func (p *KubernetesProvider) reconcileWorkload(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet) (*schedulingv1beta1.Workload, error) {
+	if templateName := lws.Annotations[GroupTemplateNameAnnotation]; templateName != "" {
+		// A parent controller owns the Workload; look it up and do not create one.
+		workload, err := p.findDelegatedWorkload(ctx, lws)
+		if err != nil {
+			return nil, NewReconcileError(ReasonParentWorkloadNotReady, err)
+		}
+		return workload, nil
+	}
+
+	desiredWorkload, err := buildFlatWorkload(lws)
+	if err != nil {
+		return nil, NewReconcileError(ReasonInvalidSchedulingConfiguration, fmt.Errorf("build Workload: %w", err))
+	}
+	desiredWorkload.TypeMeta = metav1.TypeMeta{
+		APIVersion: schedulingv1beta1.SchemeGroupVersion.String(),
+		Kind:       "Workload",
+	}
+
+	persisted, err := p.findOwnedWorkload(ctx, lws)
+	if err != nil {
+		return nil, workloadAPIError(ReasonWorkloadCreateFailed, err)
+	}
+	if persisted != nil {
+		if persisted.Name != desiredWorkload.Name {
+			return nil, NewReconcileError(ReasonInvalidSchedulingConfiguration, fmt.Errorf("owned Workload %s/%s does not have the expected UID-qualified name %q", persisted.Namespace, persisted.Name, desiredWorkload.Name))
+		}
+		// Scale can change whole-LWS gang minCount; other Workload spec fields stay immutable.
+		if err := updateMutableWorkloadFields(ctx, p.client, persisted, desiredWorkload); err != nil {
+			return nil, NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+		}
+		return persisted, nil
+	}
+
+	if err := p.client.Create(ctx, desiredWorkload); err == nil {
+		return desiredWorkload, nil
+	} else if !apierrors.IsAlreadyExists(err) {
+		return nil, workloadAPIError(ReasonWorkloadCreateFailed, fmt.Errorf("create Workload %s/%s: %w", desiredWorkload.Namespace, desiredWorkload.Name, err))
+	}
+
+	persisted = &schedulingv1beta1.Workload{}
+	key := types.NamespacedName{Namespace: desiredWorkload.Namespace, Name: desiredWorkload.Name}
+	if err := p.client.Get(ctx, key, persisted); err != nil {
+		return nil, workloadAPIError(ReasonWorkloadCreateFailed, fmt.Errorf("get existing Workload %s: %w", key, err))
+	}
+	if !workloadControlledByLWS(persisted, lws) {
+		return nil, NewReconcileError(ReasonWorkloadCreateFailed, fmt.Errorf("Workload %s already exists but is not controlled by this LeaderWorkerSet UID", key))
+	}
+	return persisted, nil
+}
+
+func (p *KubernetesProvider) findOwnedWorkload(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet) (*schedulingv1beta1.Workload, error) {
+	workloads := &schedulingv1beta1.WorkloadList{}
+	if err := p.client.List(ctx, workloads, client.InNamespace(lws.Namespace), client.MatchingFields{
+		workloadControllerUIDIndex: string(lws.UID),
+	}); err != nil {
+		return nil, fmt.Errorf("list Workloads for LeaderWorkerSet %s/%s: %w", lws.Namespace, lws.Name, err)
+	}
+	var selected *schedulingv1beta1.Workload
+	for i := range workloads.Items {
+		candidate := &workloads.Items[i]
+		if !workloadControlledByLWS(candidate, lws) {
+			continue
+		}
+		if selected != nil {
+			return nil, fmt.Errorf("multiple Workloads are controlled by LeaderWorkerSet %s/%s UID %q", lws.Namespace, lws.Name, lws.UID)
+		}
+		selected = candidate
+	}
+	return selected, nil
+}
+
+func workloadControlledByLWS(workload *schedulingv1beta1.Workload, lws *leaderworkerset.LeaderWorkerSet) bool {
+	wantOwner := metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))
+	owner := metav1.GetControllerOf(workload)
+	ref := workload.Spec.ControllerRef
+	return controllerReferencesEqual(owner, wantOwner) && ref != nil &&
+		ref.APIGroup == leaderworkerset.GroupVersion.Group && ref.Kind == "LeaderWorkerSet" && ref.Name == lws.Name
+}
+
+func controllerReferencesEqual(current, desired *metav1.OwnerReference) bool {
+	if current == nil || desired == nil {
+		return false
+	}
+	return current.APIVersion == desired.APIVersion && current.Kind == desired.Kind &&
+		current.Name == desired.Name && current.UID == desired.UID
+}
+
+// sameControllerOwner reports whether two controller references identify the
+// same object. The version of the API group is ignored, so a parent whose
+// ownerRefs move to another version of its API keeps resolving.
+func sameControllerOwner(a, b *metav1.OwnerReference) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	aGV, aErr := schema.ParseGroupVersion(a.APIVersion)
+	bGV, bErr := schema.ParseGroupVersion(b.APIVersion)
+	return aErr == nil && bErr == nil && aGV.Group == bGV.Group &&
+		a.Kind == b.Kind && a.Name == b.Name && a.UID == b.UID
+}
+
+// findDelegatedWorkload walks the LWS controller-owner chain until it finds the
+// parent-owned Workload that contains the annotated group template. Only cached
+// in-tree intermediate owners (DisaggregatedSet) are followed when no Workload
+// matches the current hop: unstructured GETs bypass the controller-runtime
+// cache on every reconcile, and manager-role has no RBAC for third-party kinds.
+func (p *KubernetesProvider) findDelegatedWorkload(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet) (*schedulingv1beta1.Workload, error) {
+	owner := metav1.GetControllerOf(lws)
+	if owner == nil {
+		return nil, fmt.Errorf("%s requires a controller owner", GroupTemplateNameAnnotation)
+	}
+
+	for hops := 0; owner != nil; hops++ {
+		// Bounds the walk without per-call allocation; this also stops cycles.
+		if hops == maxControllerOwnerHops {
+			return nil, fmt.Errorf("controller-owner chain exceeds %d hops at %s %s/%s, possibly a cycle", maxControllerOwnerHops, owner.Kind, lws.Namespace, owner.Name)
+		}
+		if owner.UID == "" {
+			return nil, fmt.Errorf("controller owner %s %s/%s has no UID", owner.Kind, lws.Namespace, owner.Name)
+		}
+
+		gv, err := schema.ParseGroupVersion(owner.APIVersion)
+		if err != nil {
+			return nil, fmt.Errorf("parse owner apiVersion %q: %w", owner.APIVersion, err)
+		}
+		workloads := &schedulingv1beta1.WorkloadList{}
+		if err := p.client.List(ctx, workloads, client.InNamespace(lws.Namespace), client.MatchingFields{
+			workloadControllerUIDIndex: string(owner.UID),
+		}); err != nil {
+			return nil, fmt.Errorf("list delegated Workloads for controller owner UID %q: %w", owner.UID, err)
+		}
+		var selected *schedulingv1beta1.Workload
+		for i := range workloads.Items {
+			candidate := &workloads.Items[i]
+			ref := candidate.Spec.ControllerRef
+			if sameControllerOwner(metav1.GetControllerOf(candidate), owner) && ref != nil &&
+				ref.APIGroup == gv.Group && ref.Kind == owner.Kind && ref.Name == owner.Name {
+				if selected != nil {
+					return nil, fmt.Errorf("multiple parent Workloads match the LWS controller-owner chain: %s/%s and %s/%s", selected.Namespace, selected.Name, candidate.Namespace, candidate.Name)
+				}
+				selected = candidate
+			}
+		}
+		if selected != nil {
+			return selected, nil
+		}
+
+		parent := cachedControllerOwnerObject(gv.Group, owner.Kind)
+		if parent == nil {
+			break
+		}
+		if err := p.client.Get(ctx, types.NamespacedName{Namespace: lws.Namespace, Name: owner.Name}, parent); err != nil {
+			return nil, fmt.Errorf("follow controller owner %s %s/%s: %w", owner.Kind, lws.Namespace, owner.Name, err)
+		}
+		if parent.GetUID() != owner.UID {
+			return nil, fmt.Errorf("controller owner %s %s/%s UID changed from %q to %q", owner.Kind, lws.Namespace, owner.Name, owner.UID, parent.GetUID())
+		}
+		owner = metav1.GetControllerOf(parent)
+	}
+	return nil, fmt.Errorf("no parent Workload matches the LWS controller-owner chain")
+}
+
+// maxControllerOwnerHops caps the delegated Workload owner walk. Only cached
+// DisaggregatedSet hops can repeat, so real chains stay far below it.
+const maxControllerOwnerHops = 8
+
+// cachedControllerOwnerObject returns a typed object for intermediate
+// controller owners that the manager caches and has RBAC to list and watch, or
+// nil for external kinds. Starting an informer via a typed Get for arbitrary
+// registered kinds (such as batch/v1 Job) would fail cache sync without RBAC.
+func cachedControllerOwnerObject(group, kind string) client.Object {
+	if group == disaggregatedsetv1.GroupVersion.Group && kind == "DisaggregatedSet" {
+		return &disaggregatedsetv1.DisaggregatedSet{}
+	}
+	return nil
+}
+
+// updateMutableWorkloadFields applies gang minCount (for example whole-LWS scale)
+// and copies labels. Other spec differences are treated as immutable drift.
+func updateMutableWorkloadFields(ctx context.Context, c client.Client, current, desired *schedulingv1beta1.Workload) error {
+	if !controllerReferencesEqual(metav1.GetControllerOf(current), metav1.GetControllerOf(desired)) ||
+		!reflect.DeepEqual(current.Spec.ControllerRef, desired.Spec.ControllerRef) {
+		return fmt.Errorf("Workload %s/%s is not controlled by the expected LeaderWorkerSet UID", current.Namespace, current.Name)
+	}
+	if len(current.Spec.PodGroupTemplates) != len(desired.Spec.PodGroupTemplates) {
+		return fmt.Errorf("Workload %s/%s has immutable PodGroup template set drift", current.Namespace, current.Name)
+	}
+	currentByName := make(map[string]int, len(current.Spec.PodGroupTemplates))
+	for i := range current.Spec.PodGroupTemplates {
+		currentByName[current.Spec.PodGroupTemplates[i].Name] = i
+	}
+
+	changed := false
+	if current.Labels == nil {
+		current.Labels = make(map[string]string, len(desired.Labels))
+	}
+	for key, value := range desired.Labels {
+		if current.Labels[key] != value {
+			current.Labels[key] = value
+			changed = true
+		}
+	}
+	for i := range desired.Spec.PodGroupTemplates {
+		newTemplate := desired.Spec.PodGroupTemplates[i]
+		oldIndex, found := currentByName[newTemplate.Name]
+		if !found {
+			return fmt.Errorf("Workload %s/%s has immutable PodGroup template set drift", current.Namespace, current.Name)
+		}
+		oldTemplate := current.Spec.PodGroupTemplates[oldIndex]
+		oldPolicy := oldTemplate.SchedulingPolicy
+		newPolicy := newTemplate.SchedulingPolicy
+		if (oldPolicy.Basic == nil) != (newPolicy.Basic == nil) ||
+			(oldPolicy.Gang == nil) != (newPolicy.Gang == nil) ||
+			!reflect.DeepEqual(oldTemplate.SchedulingConstraints, newTemplate.SchedulingConstraints) ||
+			!reflect.DeepEqual(oldTemplate.ResourceClaims, newTemplate.ResourceClaims) ||
+			!reflect.DeepEqual(oldTemplate.DisruptionMode, newTemplate.DisruptionMode) ||
+			oldTemplate.PriorityClassName != newTemplate.PriorityClassName {
+			return fmt.Errorf("Workload %s/%s has immutable scheduling configuration drift in template %q", current.Namespace, current.Name, newTemplate.Name)
+		}
+		if oldPolicy.Gang != nil && newPolicy.Gang != nil && oldPolicy.Gang.MinCount != newPolicy.Gang.MinCount {
+			current.Spec.PodGroupTemplates[oldIndex].SchedulingPolicy.Gang.MinCount = newPolicy.Gang.MinCount
+			changed = true
+		}
+	}
+	if changed {
+		if err := c.Update(ctx, current); err != nil {
+			return fmt.Errorf("update Workload %s/%s gang minCount values: %w", current.Namespace, current.Name, err)
+		}
+	}
+	return nil
+}
+
+func workloadAPIError(fallbackReason string, err error) error {
+	if apimeta.IsNoMatchError(err) {
+		return NewReconcileError(ReasonAPINotAvailable, err)
+	}
+	return NewReconcileError(fallbackReason, err)
+}
+
+func (p *KubernetesProvider) cleanupUnusedPodGroups(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, desired map[string]struct{}) error {
+	groups := &schedulingv1beta1.PodGroupList{}
+	if err := p.client.List(ctx, groups, client.InNamespace(lws.Namespace), client.MatchingLabels{
+		leaderworkerset.SetNameLabelKey: lws.Name,
+	}); err != nil {
+		return fmt.Errorf("list PodGroups: %w", err)
+	}
+	desiredOwner := metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))
+	ownedGroups := make([]*schedulingv1beta1.PodGroup, 0, len(groups.Items))
+	for i := range groups.Items {
+		group := &groups.Items[i]
+		if controllerReferencesEqual(metav1.GetControllerOf(group), desiredOwner) {
+			ownedGroups = append(ownedGroups, group)
+		}
+	}
+	if len(ownedGroups) == 0 {
+		return nil
+	}
+
+	desiredGroups := make(map[string]struct{}, len(desired))
+	for k, v := range desired {
+		desiredGroups[k] = v
+	}
+	// In replica and role modes (both Ordinal and Hash identity), each active
+	// leader pod represents an active replica whose PodGroups must be preserved.
+	// Deriving their names from the leader's labels and workload name matches
+	// CreatePodGroupIfNotExists and prevents cleanup from racing before member
+	// pods have spec.schedulingGroup populated (such as worker PodGroups in role
+	// mode before workers are created). The PodGroups of a previous leader of the
+	// same group have other names, so they are removed once no pod references
+	// them.
+	mode, err := SchedulingModeFor(lws)
+	if err == nil && (mode == SchedulingModeReplica || mode == SchedulingModeRole) {
+		leaders := &corev1.PodList{}
+		if err := p.client.List(ctx, leaders, client.InNamespace(lws.Namespace), client.MatchingLabels{
+			leaderworkerset.SetNameLabelKey:     lws.Name,
+			leaderworkerset.WorkerIndexLabelKey: "0",
+		}); err != nil {
+			return fmt.Errorf("list leader Pods before PodGroup cleanup: %w", err)
+		}
+		for i := range leaders.Items {
+			pod := &leaders.Items[i]
+			if !pod.DeletionTimestamp.IsZero() {
+				continue
+			}
+			groupIndex := pod.Labels[leaderworkerset.GroupIndexLabelKey]
+			revision := pod.Labels[leaderworkerset.RevisionKey]
+			if groupIndex == "" || revision == "" {
+				continue
+			}
+			for _, group := range replicaPodGroups(lws, mode, GroupWorkloadName(lws, pod), groupIndex, revision) {
+				desiredGroups[group.name] = struct{}{}
+			}
+		}
+	}
+	for _, group := range ownedGroups {
+		if _, keep := desiredGroups[group.Name]; keep {
+			continue
+		}
+		referencingPods := &corev1.PodList{}
+		if err := p.client.List(ctx, referencingPods, client.InNamespace(lws.Namespace), client.MatchingFields{
+			podSchedulingGroupNameIndex: group.Name,
+		}, client.Limit(1)); err != nil {
+			return fmt.Errorf("list Pods referencing PodGroup %s/%s: %w", group.Namespace, group.Name, err)
+		}
+		if len(referencingPods.Items) == 0 {
+			if err := p.client.Delete(ctx, group); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete unused PodGroup %s/%s: %w", group.Namespace, group.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// CreatePodGroupIfNotExists materializes the PodGroups of a single replica in
+// both Ordinal and Hash groupIdentity modes.
+//
+// The pod controller calls this while the leader pod still carries the group
+// replacement scheduling gate, which keeps the KEP-666 ordering: the leaf
+// PodGroup exists before any member pod can be scheduled. The PodGroup is
+// controller-owned by the LeaderWorkerSet, never by the leader pod, because it
+// has to exist before the leader can be scheduled. Every leader pod gets
+// PodGroups of its own: their names carry the group key (Hash) or the group
+// incarnation (Ordinal), both drawn when the leader pod is admitted. A
+// recreated leader therefore never waits on a PodGroup of its predecessor that
+// cleanup is deleting.
+//
+// While a rollout changes the size, the Workload templates already have the
+// gang minimum of the new size. The PodGroups of a group keep the minimum of
+// the group's own size until the rollout replaces the group.
+func (p *KubernetesProvider) CreatePodGroupIfNotExists(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod) error {
+	groups, err := leaderPodGroups(ctx, lws, leaderPod)
+	if err != nil {
+		return NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	if p.podGroupsReadyForAdmittedLeader(ctx, lws, leaderPod, groups) {
+		return nil
+	}
+	persisted, err := p.findWorkload(ctx, lws)
+	if err != nil {
+		return err
+	}
+	return p.ensurePodGroups(ctx, lws, persisted, groups)
+}
+
+// podGroupsReadyForAdmittedLeader reports whether the PodGroups of an admitted
+// leader pod need no work, so CreatePodGroupIfNotExists can skip the Workload
+// lookup and the PodGroup materialization on every reconcile of a running
+// leader. The PodGroups only gate admission, which is over once the group
+// replacement gate is lifted. A PodGroup that is missing, terminating, has a
+// gang minimum of another size, or lacks the labels or the Workload owner
+// reference that ensurePodGroups maintains takes the full path, which
+// recreates or repairs it. Changes to the immutable scheduling fields of the
+// PodGroup of an admitted leader are not reported: they no longer affect the
+// group, and reporting them used to fail every reconcile of the leader.
+func (p *KubernetesProvider) podGroupsReadyForAdmittedLeader(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod, groups []desiredPodGroup) bool {
+	if podutils.HasSchedulingGate(leaderPod, leaderworkerset.GroupReplacementSchedulingGate) {
+		return false
+	}
+	delegated := lws.Annotations[GroupTemplateNameAnnotation] != ""
+	for _, group := range groups {
+		existing := &schedulingv1beta1.PodGroup{}
+		// PodGroups live in the namespace of the LWS and its Workload, as
+		// materialized by ensurePodGroups.
+		key := types.NamespacedName{Namespace: lws.Namespace, Name: group.name}
+		if err := p.client.Get(ctx, key, existing); err != nil || !existing.DeletionTimestamp.IsZero() {
+			return false
+		}
+		if group.gangMinCount != nil && existing.Spec.SchedulingPolicy.Gang != nil && !delegated &&
+			existing.Spec.SchedulingPolicy.Gang.MinCount != *group.gangMinCount {
+			return false
+		}
+		for k, v := range group.labels {
+			if existing.Labels[k] != v {
+				return false
+			}
+		}
+		if !delegated && workloadOwnerReference(existing) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// leaderPodGroups returns the PodGroups that back the group of leaderPod, or
+// nothing when the LWS does not need pod-driven materialization.
+func leaderPodGroups(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod) ([]desiredPodGroup, error) {
+	if lws.Spec.Scheduling == nil {
+		return nil, nil
+	}
+	mode, err := SchedulingModeFor(lws)
+	if err != nil {
+		return nil, err
+	}
+	// The whole-LWS PodGroup has a group independent name and is created by
+	// the LeaderWorkerSet controller in both identity modes.
+	if mode == SchedulingModeLWS {
+		return nil, nil
+	}
+	groupIndex := leaderPod.Labels[leaderworkerset.GroupIndexLabelKey]
+	if groupIndex == "" {
+		return nil, fmt.Errorf("leader pod %s/%s has no %s label", leaderPod.Namespace, leaderPod.Name, leaderworkerset.GroupIndexLabelKey)
+	}
+	revision := leaderPod.Labels[leaderworkerset.RevisionKey]
+	if revision == "" {
+		return nil, fmt.Errorf("leader pod %s/%s has no %s label", leaderPod.Namespace, leaderPod.Name, leaderworkerset.RevisionKey)
+	}
+	groups := replicaPodGroups(lws, mode, GroupWorkloadName(lws, leaderPod), groupIndex, revision)
+	size := groupSize(ctx, lws, leaderPod)
+	for i := range groups {
+		groups[i].gangMinCount = ptr.To(leafMembership(groups[i].templateName, size))
+	}
+	return groups, nil
+}
+
+// groupSize returns the size of the group of leaderPod. It differs from the
+// current size for groups that a rollout changing the size has not replaced
+// yet. The size annotation records the size of the revision the leader pod was
+// created from; lws has that revision applied too, unless the pod controller
+// could not find it.
+//
+// The pod webhook rejects LWS pods without the size annotation, so the fallback
+// is logged: with the current size instead of the group's own, the group's
+// PodGroups get the minimum of the wrong size after a size change.
+func groupSize(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod) int32 {
+	annotation := leaderPod.Annotations[leaderworkerset.SizeAnnotationKey]
+	if size, err := strconv.ParseInt(annotation, 10, 32); err == nil && size > 0 {
+		return int32(size)
+	}
+	size := ptr.Deref(lws.Spec.LeaderWorkerTemplate.Size, 1)
+	ctrl.LoggerFrom(ctx).V(2).Info("Leader pod has no valid size annotation, using the LeaderWorkerSet size for its group",
+		"pod", klog.KObj(leaderPod), "annotation", annotation, "size", size)
+	return size
+}
+
+// findWorkload looks up the Workload that already backs the LeaderWorkerSet
+// without creating one: only the LeaderWorkerSet controller compiles and
+// creates it. Callers retry until it shows up.
+func (p *KubernetesProvider) findWorkload(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet) (*schedulingv1beta1.Workload, error) {
+	if templateName := lws.Annotations[GroupTemplateNameAnnotation]; templateName != "" {
+		workload, err := p.findDelegatedWorkload(ctx, lws)
+		if err != nil {
+			return nil, NewReconcileError(ReasonParentWorkloadNotReady, err)
+		}
+		return workload, nil
+	}
+	persisted, err := p.findOwnedWorkload(ctx, lws)
+	if err != nil {
+		return nil, workloadAPIError(ReasonWorkloadCreateFailed, err)
+	}
+	if persisted == nil {
+		return nil, NewReconcileError(ReasonWorkloadCreateFailed,
+			fmt.Errorf("Workload %s/%s has not been created yet", lws.Namespace, KubernetesWorkloadName(lws)))
+	}
+	return persisted, nil
+}
+
+func (p *KubernetesProvider) InjectPodGroupMetadata(pod *corev1.Pod) error {
+	mode := SchedulingMode(pod.Annotations[WorkloadSchedulingAnnotationKey])
+	if mode == "" {
+		return nil
+	}
+	if mode == "true" {
+		mode = SchedulingModeReplica
+	}
+	workloadName := pod.Annotations[WorkloadNameAnnotationKey]
+	if workloadName == "" {
+		workloadName = pod.Labels[leaderworkerset.SetNameLabelKey]
+	} else if ordinalReplicaLeader(pod, mode) {
+		workloadName = incarnateGroup(pod, workloadName)
+	}
+	var name string
+	switch mode {
+	case SchedulingModeLWS:
+		name = kubernetesRuntimeName(workloadName, "lws")
+	case SchedulingModeReplica:
+		name = kubernetesRuntimeName(workloadName, pod.Labels[leaderworkerset.GroupIndexLabelKey], pod.Labels[leaderworkerset.RevisionKey])
+	case SchedulingModeRole:
+		role := workerWorkloadTemplateName
+		if pod.Labels[leaderworkerset.WorkerIndexLabelKey] == "0" {
+			role = leaderWorkloadTemplateName
+		}
+		name = kubernetesRuntimeName(workloadName, pod.Labels[leaderworkerset.GroupIndexLabelKey], role, pod.Labels[leaderworkerset.RevisionKey])
+	default:
+		return fmt.Errorf("unsupported workload-aware scheduling mode %q", mode)
+	}
+	pod.Spec.SchedulingGroup = &corev1.PodSchedulingGroup{PodGroupName: ptr.To(name)}
+	return nil
+}
+
+// ordinalReplicaLeader reports whether pod is the leader of an Ordinal group
+// with replica or role level PodGroups.
+func ordinalReplicaLeader(pod *corev1.Pod, mode SchedulingMode) bool {
+	return (mode == SchedulingModeReplica || mode == SchedulingModeRole) &&
+		pod.Labels[leaderworkerset.WorkerIndexLabelKey] == "0" &&
+		pod.Annotations[leaderworkerset.GroupIdentityAnnotationKey] != string(leaderworkerset.GroupIdentityHash)
+}
+
+// incarnateGroup draws a group incarnation for an Ordinal leader pod being
+// admitted, see GroupWorkloadName. It appends it to workloadName, records the
+// result on the pod and returns it. A workload name that already ends in an
+// incarnation is kept: the LWS controller writes plain workload names on pod
+// templates, so only an earlier pass of this webhook appends one, and
+// reinvocation stays idempotent.
+func incarnateGroup(pod *corev1.Pod, workloadName string) string {
+	base, incarnation, _ := strings.Cut(workloadName, groupIncarnationSeparator)
+	if isGroupIncarnation(incarnation) {
+		return workloadName
+	}
+	workloadName = base + groupIncarnationSeparator + utilrand.String(groupIncarnationLength)
+	pod.Annotations[WorkloadNameAnnotationKey] = workloadName
+	return workloadName
+}

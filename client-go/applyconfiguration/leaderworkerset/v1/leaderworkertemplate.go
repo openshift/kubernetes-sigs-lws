@@ -47,6 +47,27 @@ type LeaderWorkerTemplateApplyConfiguration struct {
 	// The former named Default policy is deprecated, will be removed in the future,
 	// replace with None policy for the same behavior.
 	RestartPolicy *leaderworkersetv1.RestartPolicyType `json:"restartPolicy,omitempty"`
+	// maxGroupRestarts bounds how many times the controller can recreate a group
+	// under RecreateGroupOnPodRestart or RecreateGroupAfterStart. Once exhausted,
+	// the controller terminates the group, retains Pod API objects that can still
+	// receive finalizers, and stops automatic group recreation. Setting
+	// leaderworkerset.sigs.k8s.io/recover=true on the retained leader Pod resets
+	// that revision/group's budget and allows recovery. Changing this value does
+	// not resume an exhausted group. It is opt-in: when unset (nil), group
+	// recreation is unlimited.
+	// Budget exhaustion handling requires Kubernetes 1.27 or later because it
+	// relies on deleted Pods reaching a terminal phase while finalizers retain
+	// their API objects.
+	MaxGroupRestarts *int32 `json:"maxGroupRestarts,omitempty"`
+	// restartBackoff bounds group restart frequency under RecreateGroupOnPodRestart
+	// or RecreateGroupAfterStart. When specified, the controller applies an exponential
+	// backoff delay between group recreations.
+	// The semantic is that a group must have existed for at least min(baseSeconds * 2^count, capSeconds)
+	// before it can be recreated. The delay is measured from leader pod creation time,
+	// not from the failure time, so a group that has run stably for longer than the backoff
+	// delay recovers immediately on failure.
+	// It is opt-in: when unset (nil), group recreation happens immediately.
+	RestartBackoff *RestartBackoffApplyConfiguration `json:"restartBackoff,omitempty"`
 	// subGroupPolicy describes the policy that will be applied when creating subgroups
 	// in each replica.
 	SubGroupPolicy *SubGroupPolicyApplyConfiguration `json:"subGroupPolicy,omitempty"`
@@ -95,6 +116,22 @@ func (b *LeaderWorkerTemplateApplyConfiguration) WithSize(value int32) *LeaderWo
 // If called multiple times, the RestartPolicy field is set to the value of the last call.
 func (b *LeaderWorkerTemplateApplyConfiguration) WithRestartPolicy(value leaderworkersetv1.RestartPolicyType) *LeaderWorkerTemplateApplyConfiguration {
 	b.RestartPolicy = &value
+	return b
+}
+
+// WithMaxGroupRestarts sets the MaxGroupRestarts field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the MaxGroupRestarts field is set to the value of the last call.
+func (b *LeaderWorkerTemplateApplyConfiguration) WithMaxGroupRestarts(value int32) *LeaderWorkerTemplateApplyConfiguration {
+	b.MaxGroupRestarts = &value
+	return b
+}
+
+// WithRestartBackoff sets the RestartBackoff field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RestartBackoff field is set to the value of the last call.
+func (b *LeaderWorkerTemplateApplyConfiguration) WithRestartBackoff(value *RestartBackoffApplyConfiguration) *LeaderWorkerTemplateApplyConfiguration {
+	b.RestartBackoff = value
 	return b
 }
 

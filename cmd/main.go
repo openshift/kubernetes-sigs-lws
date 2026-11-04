@@ -18,8 +18,10 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
@@ -27,8 +29,11 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -37,13 +42,16 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
-	configapi "sigs.k8s.io/lws/api/config/v1alpha1"
+	configapi "sigs.k8s.io/lws/api/config/v1"
+	configapiv1alpha1 "sigs.k8s.io/lws/api/config/v1alpha1"
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/cert"
+	"sigs.k8s.io/lws/pkg/computedomain"
 	"sigs.k8s.io/lws/pkg/config"
 	"sigs.k8s.io/lws/pkg/controllers"
 	disaggregatedsetcontroller "sigs.k8s.io/lws/pkg/controllers/disaggregatedset"
+	"sigs.k8s.io/lws/pkg/features"
 	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	"sigs.k8s.io/lws/pkg/utils"
 	"sigs.k8s.io/lws/pkg/utils/useragent"
@@ -65,7 +73,11 @@ func init() {
 	utilruntime.Must(leaderworkersetv1.AddToScheme(scheme))
 	utilruntime.Must(disaggregatedsetv1.AddToScheme(scheme))
 	utilruntime.Must(configapi.AddToScheme(scheme))
+	utilruntime.Must(configapiv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(volcanov1beta1.AddToScheme(scheme))
+	utilruntime.Must(schedulingv1alpha3.AddToScheme(scheme))
+	utilruntime.Must(schedulingv1beta1.AddToScheme(scheme))
+	utilruntime.Must(computedomain.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
@@ -140,6 +152,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(cfg.FeatureGates); err != nil {
+		setupLog.Error(err, "Unable to set flag gates for known features")
+		os.Exit(1)
+	}
+
 	kubeConfig := ctrl.GetConfigOrDie()
 
 	kubeConfig.QPS = *cfg.ClientConnection.QPS
@@ -161,8 +178,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	enableWebhooks := os.Getenv("ENABLE_WEBHOOKS") != "false"
 	certsReady := make(chan struct{})
-	if cfg.InternalCertManagement != nil && *cfg.InternalCertManagement.Enable {
+	if enableWebhooks && cfg.InternalCertManagement != nil && *cfg.InternalCertManagement.Enable {
 		if err = cert.CertsManager(mgr, options.LeaderElectionNamespace, *cfg.InternalCertManagement.WebhookServiceName, *cfg.InternalCertManagement.WebhookSecretName, cfg.Webhook.CertDir, certsReady); err != nil {
 			setupLog.Error(err, "unable to setup cert rotation")
 			os.Exit(1)
@@ -173,14 +191,45 @@ func main() {
 
 	if err := controllers.SetupIndexes(mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to setup indexes")
+		os.Exit(1)
+	}
+	if cfg.GangSchedulingManagement != nil &&
+		cfg.GangSchedulingManagement.SchedulerProvider != nil &&
+		*cfg.GangSchedulingManagement.SchedulerProvider == string(schedulerprovider.Kubernetes) {
+		if err := schedulerprovider.SetupKubernetesIndexes(mgr.GetFieldIndexer()); err != nil {
+			setupLog.Error(err, "unable to setup Kubernetes scheduler provider indexes")
+			os.Exit(1)
+		}
+	}
+	if features.Enabled(features.AutoComputeDomain) {
+		if err := computedomain.SetupIndexes(mgr.GetFieldIndexer()); err != nil {
+			setupLog.Error(err, "unable to setup ComputeDomain field indexes")
+			os.Exit(1)
+		}
 	}
 
-	// Cert won't be ready until manager starts, so start a goroutine here which
-	// will block until the cert is ready before setting up the controllers.
-	// Controllers who register after manager starts will start directly.
-	go setupControllers(mgr, certsReady, cfg)
+	// Register controllers before starting the manager so an elected leader does
+	// not hold the lease without running reconcilers while waiting for its local
+	// webhook certificate volume mount to project.
+	sp, providerType, err := setupControllers(mgr, cfg)
+	if err != nil {
+		setupLog.Error(err, "unable to setup controllers")
+		os.Exit(1)
+	}
 
-	setupHealthzAndReadyzCheck(mgr)
+	webhooksReady := make(chan struct{})
+	if enableWebhooks {
+		// Cert won't be ready until manager starts, so start a goroutine here which
+		// will block until the cert is ready before setting up the webhooks.
+		go func() {
+			if err := setupWebhooks(mgr, certsReady, webhooksReady, sp, providerType); err != nil {
+				setupLog.Error(err, "unable to setup webhooks")
+				os.Exit(1)
+			}
+		}()
+	}
+
+	setupHealthzAndReadyzCheck(mgr, webhooksReady, enableWebhooks)
 	setupLog.Info("starting manager")
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
@@ -189,73 +238,99 @@ func main() {
 	}
 
 }
-func setupControllers(mgr ctrl.Manager, certsReady chan struct{}, cfg configapi.Configuration) {
-	// The controllers won't work until the webhooks are operating,
-	// and the webhook won't work until the certs are all in places.
-	setupLog.Info("waiting for the cert generation to complete")
-	<-certsReady
-	setupLog.Info("certs ready")
 
-	if err := controllers.NewLeaderWorkerSetReconciler(
+func setupControllers(mgr ctrl.Manager, cfg configapi.Configuration) (schedulerprovider.SchedulerProvider, schedulerprovider.ProviderType, error) {
+	// Set up scheduler provider before controllers and webhooks so every
+	// component observes the same provider.
+	var (
+		err          error
+		sp           schedulerprovider.SchedulerProvider
+		providerType schedulerprovider.ProviderType
+	)
+	if cfg.GangSchedulingManagement != nil && cfg.GangSchedulingManagement.SchedulerProvider != nil {
+		providerType = schedulerprovider.ProviderType(*cfg.GangSchedulingManagement.SchedulerProvider)
+		sp, err = schedulerprovider.NewSchedulerProvider(providerType, mgr.GetClient())
+		if err != nil {
+			return nil, "", fmt.Errorf("creating scheduler provider %q: %w", providerType, err)
+		}
+		setupLog.Info("Gang scheduling enabled", "provider", providerType)
+	}
+	if features.Enabled(features.AutoComputeDomain) {
+		if err := computedomain.VerifyAPI(mgr.GetRESTMapper()); err != nil {
+			return nil, "", fmt.Errorf("AutoComputeDomain feature gate requires the NVIDIA ComputeDomain CRD: %w", err)
+		}
+		if err := computedomain.NewReconciler(mgr.GetClient()).SetupWithManager(mgr); err != nil {
+			return nil, "", fmt.Errorf("creating ComputeDomain controller: %w", err)
+		}
+		setupLog.Info("AutoComputeDomain management enabled")
+	}
+
+	lwsController := controllers.NewLeaderWorkerSetReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		mgr.GetEventRecorder("leaderworkerset"),
-	).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "LeaderWorkerSet")
-		os.Exit(1)
+		sp,
+	)
+	if err := lwsController.SetupWithManager(mgr); err != nil {
+		return nil, "", fmt.Errorf("creating LeaderWorkerSet controller: %w", err)
 	}
 	// Set up DisaggregatedSet controller
-	if err := (&disaggregatedsetcontroller.DisaggregatedSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Record: mgr.GetEventRecorder("disaggregatedset"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DisaggregatedSet")
-		os.Exit(1)
-	}
-	// Set up scheduler provider
-	var sp schedulerprovider.SchedulerProvider
-	if cfg.GangSchedulingManagement != nil {
-		var err error
-		sp, err = schedulerprovider.NewSchedulerProvider(schedulerprovider.ProviderType(*cfg.GangSchedulingManagement.SchedulerProvider), mgr.GetClient())
-		if err != nil {
-			setupLog.Error(err, "unable to create scheduler provider", "provider", *cfg.GangSchedulingManagement.SchedulerProvider)
-			os.Exit(1)
-		}
-		setupLog.Info("Gang scheduling enabled", "provider", *cfg.GangSchedulingManagement.SchedulerProvider)
+	disaggregatedSetController := disaggregatedsetcontroller.NewDisaggregatedSetReconciler(
+		mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorder("disaggregatedset"),
+	)
+	if err := disaggregatedSetController.SetupWithManager(mgr); err != nil {
+		return nil, "", fmt.Errorf("creating DisaggregatedSet controller: %w", err)
 	}
 	// Set up pod reconciler.
 	podController := controllers.NewPodReconciler(mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorder("leaderworkerset"), sp)
 	if err := podController.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Pod")
-		os.Exit(1)
-	}
-	// Set up webhooks
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhooks.SetupLeaderWorkerSetWebhook(mgr); err != nil {
-			setupLog.Error(err, "unable to create leaderworkerset webhook", "webhook", "LeaderWorkerSet")
-			os.Exit(1)
-		}
-		pw := webhooks.NewPodWebhook(sp)
-		if err := pw.Setup(mgr); err != nil {
-			setupLog.Error(err, "unable to create pod webhook", "webhook", "LeaderWorkerSet")
-			os.Exit(1)
-		}
-		if err := disaggregatedsetwebhook.SetupDisaggregatedSetWebhook(mgr); err != nil {
-			setupLog.Error(err, "unable to create disaggregatedset webhook", "webhook", "DisaggregatedSet")
-			os.Exit(1)
-		}
+		return nil, "", fmt.Errorf("creating Pod controller: %w", err)
 	}
 	//+kubebuilder:scaffold:builder
+	return sp, providerType, nil
 }
 
-func setupHealthzAndReadyzCheck(mgr ctrl.Manager) {
+func setupWebhooks(mgr ctrl.Manager, certsReady <-chan struct{}, webhooksReady chan<- struct{}, sp schedulerprovider.SchedulerProvider, providerType schedulerprovider.ProviderType) error {
+	setupLog.Info("waiting for the cert generation to complete")
+	<-certsReady
+	setupLog.Info("certs ready")
+
+	if err := webhooks.SetupLeaderWorkerSetWebhook(mgr, webhooks.LeaderWorkerSetWebhook{
+		SchedulerProvider: providerType,
+	}); err != nil {
+		return fmt.Errorf("creating LeaderWorkerSet webhook: %w", err)
+	}
+	pw := webhooks.NewPodWebhook(sp)
+	if err := pw.Setup(mgr); err != nil {
+		return fmt.Errorf("creating Pod webhook: %w", err)
+	}
+	if err := disaggregatedsetwebhook.SetupDisaggregatedSetWebhook(mgr); err != nil {
+		return fmt.Errorf("creating DisaggregatedSet webhook: %w", err)
+	}
+	close(webhooksReady)
+	return nil
+}
+
+func setupHealthzAndReadyzCheck(mgr ctrl.Manager, webhooksReady <-chan struct{}, enableWebhooks bool) {
 	defer setupLog.Info("both healthz and readyz check are finished and configured")
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	readyz := healthz.Ping
+	if enableWebhooks {
+		// The first GetWebhookServer call starts the webhook server, so the
+		// check waits until setupWebhooks has registered the webhooks.
+		readyz = func(req *http.Request) error {
+			select {
+			case <-webhooksReady:
+				return mgr.GetWebhookServer().StartedChecker()(req)
+			default:
+				return errors.New("webhooks are not registered yet")
+			}
+		}
+	}
+	if err := mgr.AddReadyzCheck("readyz", readyz); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
@@ -303,7 +378,7 @@ func apply(configFile string,
 		options.LeaderElectionID = leaderElectionID
 	}
 
-	// 1. LWS Pattern: Parse the TLS config first
+	// Parse TLS options from the configuration.
 	var parsedTLSConfig *config.TLS
 	if cfg.TLS != nil { // Note: cfg.TLS, not cfg.Webhook.TLS
 		var err error
@@ -324,7 +399,7 @@ func apply(configFile string,
 
 	serverTLSOpts := []func(*tls.Config){disableHTTP2}
 
-	// 3. LWS Pattern: Build and apply parsed TLS configuration from config
+	// Append TLS options parsed from the configuration.
 	if parsedTLSConfig != nil {
 		tlsOpts := config.BuildTLSOptions(parsedTLSConfig)
 		serverTLSOpts = append(serverTLSOpts, tlsOpts...)
@@ -347,12 +422,10 @@ func apply(configFile string,
 
 	options.Metrics = metricsServerOptions
 	options.LeaderElectionNamespace = namespace
+	if err := controllers.ConfigureCacheOptions(&options.Cache); err != nil {
+		return options, cfg, fmt.Errorf("unable to configure manager cache options: %w", err)
+	}
 
-	//// 5. Inject into Webhook Server
-	//options.WebhookServer = webhook.NewServer(webhook.Options{
-	//	TLSOpts: serverTLSOpts,
-	//	CertDir: cfg.Webhook.CertDir,
-	//})
 	config.AddWebhookSettingsTo(&options, &cfg, serverTLSOpts)
 
 	setupLog.Info("Successfully loaded configuration", "config", cfgStr)

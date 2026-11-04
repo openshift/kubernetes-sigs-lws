@@ -5,12 +5,33 @@
 nameOverride: ""
 fullnameOverride: ""
 enablePrometheus: false
+serviceMonitor:
+  extraLabels: {}
+  # Example override:
+  #   extraLabels:
+  #     release: my-prometheus-sm-selector
 enableCertManager: false
-# enableDisaggregatedSet installs the DisaggregatedSet editor/viewer/admin
-# ClusterRoles and the validating webhook. The CRD (under crds/), the
-# bundled controller, and its manager RBAC are always installed.
-enableDisaggregatedSet: false
+# replicaCount above 1 runs standby managers: leader election keeps a single
+# active reconciler, while every replica serves the webhooks.
 replicaCount: 1
+serviceAccount:
+  # name of the controller manager ServiceAccount. Defaults to
+  # <fullname>-controller-manager when empty.
+  name: ""
+# PodDisruptionBudget for the manager Deployment, rendered only when
+# replicaCount is greater than 1.
+# Ref: https://kubernetes.io/docs/tasks/run-application/configure-pdb/
+pdb:
+  # Enable PodDisruptionBudget.
+  enabled: true
+  # Minimum pods that must remain available after eviction (int or quoted percent).
+  minAvailable: 1
+  # Maximum pods that may be unavailable (int or quoted percent). Rendered only
+  # when set, and takes precedence over minAvailable.
+  maxUnavailable: null
+  # When manager pods that are not Ready may be evicted: AlwaysAllow or
+  # IfHealthyBudget. Set to null to use the cluster default (IfHealthyBudget).
+  unhealthyPodEvictionPolicy: AlwaysAllow
 imagePullSecrets: []
 # Customize controlerManager
 image:
@@ -18,6 +39,8 @@ image:
     repository: registry.k8s.io/lws/lws
     # tag, if defined will use the given image tag, else Chart.AppVersion will be used
     tag: main
+    # digest, if defined (e.g. sha256:...), pins the image by digest and the tag is ignored
+    digest: ""
     pullPolicy: Always
 podAnnotations: {}
 podSecurityContext:
@@ -58,3 +81,18 @@ affinity: {}
 # gangSchedulingManagement:
 #   schedulerProvider: volcano
 gangSchedulingManagement: {}
+# computeDomainManagement configures RBAC permissions for managing NVIDIA DRA
+# ComputeDomain resources (computedomains.resource.nvidia.com) when using the
+# AutoComputeDomain feature gate.
+computeDomainManagement:
+  enabled: false
+# Alpha LWS feature gates. WorkloadAwareScheduling and AutoComputeDomain are disabled by default.
+featureGates: {}
+# leaderElection overrides the manager's lease timing. Empty keeps the
+# controller defaults (15s lease, 10s renew deadline, 2s retry period).
+# For example:
+# leaderElection:
+#   leaseDuration: 60s
+#   renewDeadline: 30s
+#   retryPeriod: 6s
+leaderElection: {}

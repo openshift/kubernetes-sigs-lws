@@ -17,19 +17,40 @@ limitations under the License.
 package disaggregatedset
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
+	"strings"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 )
 
-const NumRequiredRoles = 2
+const NumRequiredRoles = 1
 
+// IsOwnedByDisaggregatedSet reports whether the object's controller owner is a DisaggregatedSet.
+func IsOwnedByDisaggregatedSet(object metav1.Object) bool {
+	owner := metav1.GetControllerOf(object)
+	if owner == nil {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	return err == nil && gv.Group == disaggregatedsetv1.GroupVersion.Group && owner.Kind == "DisaggregatedSet"
+}
+
+// GetInitialReplicas returns a valid non-negative initial-replicas annotation.
+// Missing, empty, malformed, negative, or out-of-range values are treated as
+// unset so the controller can reconstruct the baseline from observed state.
 func GetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int32, bool) {
 	if leaderWorkerSet.Annotations == nil {
 		return 0, false
@@ -39,17 +60,10 @@ func GetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet) (int
 		return 0, false
 	}
 	parsed, err := strconv.ParseInt(value, 10, 32)
-	if err != nil {
+	if err != nil || parsed < 0 {
 		return 0, false
 	}
 	return int32(parsed), true
-}
-
-func SetInitialReplicas(leaderWorkerSet *leaderworkersetv1.LeaderWorkerSet, replicas int32) {
-	if leaderWorkerSet.Annotations == nil {
-		leaderWorkerSet.Annotations = make(map[string]string)
-	}
-	leaderWorkerSet.Annotations[disaggregatedsetv1.InitialReplicasAnnotationKey] = strconv.FormatInt(int64(replicas), 10)
 }
 
 func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map[string]int {
@@ -80,24 +94,8 @@ func ComputeInitialReplicaState(lwsList []leaderworkersetv1.LeaderWorkerSet) map
 	return state
 }
 
-type CreateParams struct {
-	DisaggregatedSet *disaggregatedsetv1.DisaggregatedSet
-	Role             string
-	Slice            int
-	Config           *disaggregatedsetv1.DisaggregatedRoleSpec
-	Revision         string
-	Labels           map[string]string
-	Replicas         int
-}
-
 func GenerateName(baseName string, slice int, revision, role string) string {
 	return fmt.Sprintf("%s-%d-%s-%s", baseName, slice, revision, role)
-}
-
-// GenerateLegacyName returns the pre-slices LWS name (no slice segment). Used to
-// find and adopt objects created before the slices feature, which belong to slice 0.
-func GenerateLegacyName(baseName, revision, role string) string {
-	return fmt.Sprintf("%s-%s-%s", baseName, revision, role)
 }
 
 func GenerateLabels(baseName string, slice int, revision, role string) map[string]string {
@@ -118,44 +116,111 @@ func GetSlices(disaggregatedSet *disaggregatedsetv1.DisaggregatedSet) int32 {
 	return *disaggregatedSet.Spec.Slices
 }
 
-// SliceLabelMatches reports whether an object's labels place it in the given slice.
-// A slice < 0 matches all slices. Slice 0 also matches a legacy object that carries
-// no slice label, so pre-slices objects are adopted as slice 0.
-func SliceLabelMatches(labels map[string]string, slice int) bool {
-	if slice < 0 {
-		return true
-	}
-	value, ok := labels[disaggregatedsetv1.SliceLabelKey]
-	if !ok || value == "" {
-		return slice == 0
-	}
-	return value == strconv.Itoa(slice)
-}
-
-// HasSliceLabel reports whether an object carries a non-empty slice label, i.e. it
-// was created by the slices-aware controller rather than a pre-slices release.
-func HasSliceLabel(labels map[string]string) bool {
-	value, ok := labels[disaggregatedsetv1.SliceLabelKey]
-	return ok && value != ""
-}
-
 const revisionLength = 8
 
-func ComputeRevision(roles []disaggregatedsetv1.DisaggregatedRoleSpec) string {
+// ComputeRevisionV1 implements the original DisaggregatedSet revision hash.
+// Keep this function stable: existing unversioned DisaggregatedSets continue to
+// use it so upgrading the controller does not replace otherwise unchanged LWS
+// objects.
+func ComputeRevisionV1(roles []disaggregatedsetv1.DisaggregatedRoleSpec) string {
 	type roleTemplate struct {
-		Name     string                                 `json:"name"`
-		Template leaderworkersetv1.LeaderWorkerTemplate `json:"template"`
+		Name string `json:"name"`
+		// GroupIdentity is normalized so "" and the CRD default Ordinal hash
+		// identically: objects persisted before the field existed must keep
+		// their revision once the API server starts defaulting it on reads.
+		GroupIdentity leaderworkersetv1.GroupIdentityType    `json:"groupIdentity,omitempty"`
+		Template      leaderworkersetv1.LeaderWorkerTemplate `json:"template"`
 	}
 
 	templates := make([]roleTemplate, 0, len(roles))
 	for _, role := range roles {
+		groupIdentity := role.Spec.GroupIdentity
+		if groupIdentity == leaderworkersetv1.GroupIdentityOrdinal {
+			groupIdentity = ""
+		}
 		templates = append(templates, roleTemplate{
-			Name:     role.Name,
-			Template: role.Spec.LeaderWorkerTemplate,
+			Name:          role.Name,
+			GroupIdentity: groupIdentity,
+			Template:      role.Spec.LeaderWorkerTemplate,
 		})
 	}
 
-	jsonData, err := json.Marshal(templates)
+	return computeRevision(templates)
+}
+
+// ComputeRevision returns the current revision hash. Unlike the legacy
+// algorithm, it covers every generated LWS field that requires a coordinated
+// rollout and treats the map-style role list as order independent.
+func ComputeRevision(roles []disaggregatedsetv1.DisaggregatedRoleSpec) string {
+	revisionRoles := slices.Clone(roles)
+	for i := range revisionRoles {
+		role := &revisionRoles[i]
+
+		// Scaling only selects where the desired replica count comes from.
+		role.Scaling = nil
+		// Routing partitions and their replica targets do not change the template.
+		role.SubRoles = nil
+
+		// The LWS manager propagates only labels and annotations from template
+		// metadata. Fields such as name, namespace, and finalizers are ignored.
+		role.ObjectMeta = metav1.ObjectMeta{
+			Labels:      role.Labels,
+			Annotations: role.Annotations,
+		}
+
+		// Replicas is reconciled in place and does not identify a workload revision.
+		role.Spec.Replicas = nil
+		// RolloutStrategy is consumed by the DisaggregatedSet rollout planner; a
+		// policy change adjusts rollout pacing rather than workload identity.
+		role.Spec.RolloutStrategy = leaderworkersetv1.RolloutStrategy{}
+
+		// GroupReplacementPolicy is patched onto existing LWS objects in place.
+		role.Spec.GroupReplacementPolicy = ""
+
+		// SequentialPodTerminationPolicy is normalized to "" so CRD upgrading does not change
+		// revision hashes for existing DisaggregatedSet workloads.
+		if role.Spec.PodTerminationPolicy == leaderworkersetv1.SequentialPodTerminationPolicy {
+			role.Spec.PodTerminationPolicy = ""
+		}
+	}
+
+	// spec.roles is a map-style list keyed by name, so its order has no
+	// semantic meaning and must not trigger a rollout.
+	slices.SortFunc(revisionRoles, func(a, b disaggregatedsetv1.DisaggregatedRoleSpec) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+
+	return computeRevision(revisionRoles)
+}
+
+// ComputeDisaggregatedSetRevision returns the current revision hash for
+// disaggregatedSet, incorporating slice-scoped auto-compute-domain enrollment
+// while preserving byte-identical v2 hashes when slice-scoped
+// auto-compute-domain is unset or disabled.
+func ComputeDisaggregatedSetRevision(disaggregatedSet *disaggregatedsetv1.DisaggregatedSet) string {
+	if disaggregatedSet == nil {
+		return ComputeRevision(nil)
+	}
+	if disaggregatedSet.Annotations[disaggregatedsetv1.AutoComputeDomainAnnotationKey] != leaderworkersetv1.AutoComputeDomainEnabled {
+		return ComputeRevision(disaggregatedSet.Spec.Roles)
+	}
+	roles := slices.Clone(disaggregatedSet.Spec.Roles)
+	for i := range roles {
+		if roles[i].Annotations[disaggregatedsetv1.AutoComputeDomainAnnotationKey] == leaderworkersetv1.AutoComputeDomainDisabled {
+			continue
+		}
+		annotations := maps.Clone(roles[i].Annotations)
+		if annotations == nil {
+			annotations = make(map[string]string, 1)
+		}
+		annotations[disaggregatedsetv1.AutoComputeDomainAnnotationKey] = leaderworkersetv1.AutoComputeDomainEnabled
+		roles[i].Annotations = annotations
+	}
+	return ComputeRevision(roles)
+}
+
+func computeRevision(value any) string {
+	jsonData, err := json.Marshal(value)
 	if err != nil {
 		return ""
 	}
@@ -179,6 +244,23 @@ func GetRoleConfigs(disaggregatedSet *disaggregatedsetv1.DisaggregatedSet) map[s
 	return roleConfigs
 }
 
+// SubRoleRolloutConfig resolves each child override independently, without
+// changing the parent's policy. An unnamed child represents an ordinary role.
+func SubRoleRolloutConfig(role *disaggregatedsetv1.DisaggregatedRoleSpec, child *disaggregatedsetv1.DisaggregatedSubRoleSpec) leaderworkersetv1.RollingUpdateConfiguration {
+	// The LeaderWorkerSet default: a rollout needs no capacity beyond the role's replicas.
+	config := leaderworkersetv1.RollingUpdateConfiguration{MaxSurge: intstr.FromInt(0), MaxUnavailable: intstr.FromInt(1)}
+	if parent := role.Spec.RolloutStrategy.RollingUpdateConfiguration; parent != nil {
+		config = *parent
+	}
+	if child.MaxSurge != nil {
+		config.MaxSurge = *child.MaxSurge
+	}
+	if child.MaxUnavailable != nil {
+		config.MaxUnavailable = *child.MaxUnavailable
+	}
+	return config
+}
+
 func GetRoleNames(disaggregatedSet *disaggregatedsetv1.DisaggregatedSet) []string {
 	names := make([]string, len(disaggregatedSet.Spec.Roles))
 	for i, role := range disaggregatedSet.Spec.Roles {
@@ -193,6 +275,30 @@ type RevisionRoles struct {
 }
 
 type RevisionRolesList []RevisionRoles
+
+// LatestCreationTime returns the newest LWS creation time in the revision.
+func (revision RevisionRoles) LatestCreationTime() time.Time {
+	var latest time.Time
+	for _, lws := range revision.Roles {
+		if lws.CreationTimestamp.Time.After(latest) {
+			latest = lws.CreationTimestamp.Time
+		}
+	}
+	return latest
+}
+
+// SortedByNewestTimestamp returns a copy ordered by the newest LWS creation
+// time in each revision, then by revision ID. The receiver is unchanged.
+func (revisions RevisionRolesList) SortedByNewestTimestamp() RevisionRolesList {
+	sorted := slices.Clone(revisions)
+	slices.SortFunc(sorted, func(a, b RevisionRoles) int {
+		if byTime := b.LatestCreationTime().Compare(a.LatestCreationTime()); byTime != 0 {
+			return byTime
+		}
+		return strings.Compare(a.Revision, b.Revision)
+	})
+	return sorted
+}
 
 func getLWSReplicas(lws *leaderworkersetv1.LeaderWorkerSet) int {
 	if lws.Spec.Replicas == nil {
@@ -211,19 +317,15 @@ func (revisions RevisionRolesList) GetTotalReplicasPerRole(role string) int {
 	return total
 }
 
-func (revisions RevisionRolesList) GetTotalInitialReplicasPerRole(role string) int {
-	total := 0
-	for _, rev := range revisions {
-		if lws := rev.Roles[role]; lws != nil {
-			initialReplicas, ok := GetInitialReplicas(lws)
-			if ok {
-				total += int(initialReplicas)
-			} else {
-				total += getLWSReplicas(lws)
-			}
-		}
+func (revision RevisionRoles) GetInitialReplicasPerRole(role string) int {
+	lws := revision.Roles[role]
+	if lws == nil {
+		return 0
 	}
-	return total
+	if initialReplicas, ok := GetInitialReplicas(lws); ok {
+		return int(initialReplicas)
+	}
+	return getLWSReplicas(lws)
 }
 
 func GroupByRevision(lwsList []*leaderworkersetv1.LeaderWorkerSet) RevisionRolesList {

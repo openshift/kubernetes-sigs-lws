@@ -22,11 +22,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/computedomain"
+	"sigs.k8s.io/lws/pkg/features"
 	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	"sigs.k8s.io/lws/pkg/utils"
 	acceleratorutils "sigs.k8s.io/lws/pkg/utils/accelerators"
@@ -99,25 +102,56 @@ func (p *PodWebhook) Default(ctx context.Context, pod *corev1.Pod) error {
 	}
 	// adding labels for pods
 	if podutils.LeaderPod(*pod) {
-		// add group index label to group pods
-		if _, found := pod.Labels[leaderworkerset.GroupIndexLabelKey]; !found {
+		hashIdentity := pod.Annotations[leaderworkerset.GroupIdentityAnnotationKey] == string(leaderworkerset.GroupIdentityHash)
+		var groupUniqueKey string
+		if hashIdentity {
+			// Hash-identity leaders are created through a Deployment: the pod name is
+			// not known at admission (generateName), so the group identity is a fresh
+			// random key rather than a name-derived ordinal.
+			// Keep the key from an earlier pass of this webhook, recognized by the
+			// host name derived from it, so reinvocation is idempotent.
+			groupUniqueKey = pod.Labels[leaderworkerset.GroupUniqueHashLabelKey]
+			if groupUniqueKey == "" || pod.Spec.Hostname != hashLeaderHostname(pod.Labels[leaderworkerset.SetNameLabelKey], groupUniqueKey) {
+				groupUniqueKey = genGroupUniqueKey(pod.Namespace, utilrand.String(16))
+			}
+			pod.Labels[leaderworkerset.GroupUniqueHashLabelKey] = groupUniqueKey
+			pod.Labels[leaderworkerset.GroupIndexLabelKey] = groupUniqueKey
+			// The host name is immutable, so admission is the only chance to set it.
+			// The subdomain default comes from the pod template.
+			if pod.Spec.Hostname == "" {
+				pod.Spec.Hostname = hashLeaderHostname(pod.Labels[leaderworkerset.SetNameLabelKey], groupUniqueKey)
+			}
+		} else {
 			_, groupIndex := statefulsetutils.GetParentNameAndOrdinal(pod.Name)
 			if groupIndex == -1 {
 				return fmt.Errorf("parsing pod ordinal for pod %s", pod.Name)
 			}
 			pod.Labels[leaderworkerset.GroupIndexLabelKey] = fmt.Sprint(groupIndex)
+			groupUniqueKey = genGroupUniqueKey(pod.Namespace, pod.Name)
+			pod.Labels[leaderworkerset.GroupUniqueHashLabelKey] = groupUniqueKey
+		}
+		// Every leader starts gated. The pod controller creates any per-replica
+		// scheduling prerequisites (such as leaf PodGroups) while the leader is
+		// gated and lifts the gate according to the LeaderWorkerSet's
+		// groupReplacementPolicy, which it reads from the LWS object rather than
+		// from the pod template so that changing the policy does not roll the
+		// leaders.
+		if !podutils.HasSchedulingGate(pod, leaderworkerset.GroupReplacementSchedulingGate) {
+			pod.Spec.SchedulingGates = append(pod.Spec.SchedulingGates, corev1.PodSchedulingGate{Name: leaderworkerset.GroupReplacementSchedulingGate})
+			if hashIdentity {
+				if _, exists := pod.Annotations[corev1.PodDeletionCost]; !exists {
+					pod.Annotations[corev1.PodDeletionCost] = "-100"
+				}
+			}
 		}
 		subdomainPolicy, foundSubdomainPolicy := pod.Annotations[leaderworkerset.SubdomainPolicyAnnotationKey]
 		if foundSubdomainPolicy && subdomainPolicy == string(leaderworkerset.SubdomainUniquePerReplica) {
+			// The per replica service is named after the leader: the pod name in
+			// ordinal mode, the assigned host name in hash mode.
 			pod.Spec.Subdomain = pod.Name
-		}
-		// add group unique key label for exclusive placement, and use it to check whether the node affinity has been applied
-		var groupUniqueKey string
-		if _, foundGroupKey := pod.Labels[leaderworkerset.GroupUniqueHashLabelKey]; !foundGroupKey {
-			groupUniqueKey = genGroupUniqueKey(pod.Namespace, pod.Name)
-			pod.Labels[leaderworkerset.GroupUniqueHashLabelKey] = groupUniqueKey
-		} else {
-			groupUniqueKey = pod.Labels[leaderworkerset.GroupUniqueHashLabelKey]
+			if hashIdentity {
+				pod.Spec.Subdomain = pod.Spec.Hostname
+			}
 		}
 		if epKey, foundEpKey := pod.Annotations[leaderworkerset.ExclusiveKeyAnnotationKey]; foundEpKey {
 			SetExclusiveAffinities(pod, groupUniqueKey, epKey, leaderworkerset.GroupUniqueHashLabelKey)
@@ -125,9 +159,14 @@ func (p *PodWebhook) Default(ctx context.Context, pod *corev1.Pod) error {
 		_, foundSubGroupSize := pod.Annotations[leaderworkerset.SubGroupSizeAnnotationKey]
 		subGroupPolicyType := pod.Annotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey]
 		if foundSubGroupSize && pod.Labels[leaderworkerset.SubGroupIndexLabelKey] == "" && (subGroupPolicyType != string(leaderworkerset.SubGroupPolicyTypeLeaderExcluded)) {
-			// The leader pod always lands on SubGroup 0.
+			// The leader pod always lands on SubGroup 0. In hash mode the subgroup
+			// hash derives from the group key instead of the leader pod name.
 			pod.Labels[leaderworkerset.SubGroupIndexLabelKey] = "0"
-			subGroupUniqueKey := genGroupUniqueKey(pod.Name, "0")
+			subGroupKeyInput := pod.Name
+			if hashIdentity {
+				subGroupKeyInput = groupUniqueKey
+			}
+			subGroupUniqueKey := genGroupUniqueKey(subGroupKeyInput, "0")
 			pod.Labels[leaderworkerset.SubGroupUniqueHashLabelKey] = subGroupUniqueKey
 			if subEpKey, foundSubEpKey := pod.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]; foundSubEpKey {
 				SetExclusiveAffinities(pod, subGroupUniqueKey, subEpKey, leaderworkerset.SubGroupUniqueHashLabelKey)
@@ -145,10 +184,15 @@ func (p *PodWebhook) Default(ctx context.Context, pod *corev1.Pod) error {
 			if err != nil {
 				return err
 			}
-			leaderName := pod.Annotations[leaderworkerset.LeaderPodNameAnnotationKey]
+			// In hash mode the subgroup hash derives from the group key, matching
+			// what the leader computed at its own admission when it had no name.
+			subGroupKeyInput := pod.Annotations[leaderworkerset.LeaderPodNameAnnotationKey]
+			if pod.Annotations[leaderworkerset.GroupIdentityAnnotationKey] == string(leaderworkerset.GroupIdentityHash) {
+				subGroupKeyInput = pod.Labels[leaderworkerset.GroupUniqueHashLabelKey]
+			}
 			subGroupIndexKey := getSubGroupIndex(podCount, subGroupSizeInt, workerIndex)
 			pod.Labels[leaderworkerset.SubGroupIndexLabelKey] = subGroupIndexKey
-			subGroupUniqueKey := genGroupUniqueKey(leaderName, subGroupIndexKey)
+			subGroupUniqueKey := genGroupUniqueKey(subGroupKeyInput, subGroupIndexKey)
 			pod.Labels[leaderworkerset.SubGroupUniqueHashLabelKey] = subGroupUniqueKey
 			if subEpKey, foundSubEpKey := pod.Annotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey]; foundSubEpKey {
 				SetExclusiveAffinities(pod, subGroupUniqueKey, subEpKey, leaderworkerset.SubGroupUniqueHashLabelKey)
@@ -161,6 +205,14 @@ func (p *PodWebhook) Default(ctx context.Context, pod *corev1.Pod) error {
 		if err != nil {
 			return err
 		}
+	} else if pod.Annotations[schedulerprovider.WorkloadSchedulingAnnotationKey] != "" {
+		return fmt.Errorf("pod %s requests workload-aware scheduling but no scheduler provider is configured", pod.Name)
+	}
+
+	if features.Enabled(features.AutoComputeDomain) {
+		if err := computedomain.InjectPodClaims(pod); err != nil {
+			return err
+		}
 	}
 
 	// injecting env vars if needed
@@ -170,15 +222,48 @@ func (p *PodWebhook) Default(ctx context.Context, pod *corev1.Pod) error {
 		}
 	}
 
-	if err := podutils.AddLWSVariables(pod); err != nil {
+	// Worker pods carry the leader's DNS address in an annotation stamped on the
+	// worker statefulset template by the pod controller. Leader pods derive it
+	// from their own DNS identity. Pods with neither carry an ordinal identity
+	// and their labels name the leader.
+	leaderAddress := pod.Annotations[leaderworkerset.LeaderAddressAnnotationKey]
+	if leaderAddress == "" {
+		groupIndex, foundGroupIndex := pod.Labels[leaderworkerset.GroupIndexLabelKey]
+		if !foundGroupIndex {
+			return fmt.Errorf("no group index label found for pod %s", pod.Name)
+		}
+		host := fmt.Sprintf("%s-%s", pod.Labels[leaderworkerset.SetNameLabelKey], groupIndex)
+		if podutils.LeaderPod(*pod) && pod.Spec.Hostname != "" {
+			host = pod.Spec.Hostname
+		}
+		leaderAddress = fmt.Sprintf("%s.%s.%s", host, pod.Spec.Subdomain, pod.Namespace)
+	}
+	if err := podutils.AddLWSVariables(pod, leaderAddress); err != nil {
 		return err
 	}
+	podutils.AddDisaggregatedSetVariables(pod)
 
 	return nil
 }
 
 func genGroupUniqueKey(ns string, podName string) string {
 	return utils.Sha1Hash(fmt.Sprintf("%s/%s", ns, podName))
+}
+
+// HashDNSPrefixLength is how much of the group key goes into DNS facing names
+// (leader hostname, per-replica service name). 8 hex characters is 32 bits, the
+// same width as the pod template hash Deployments already rely on, and keeps
+// the LeaderWorkerSet's share of the 63 character name budgets large.
+const HashDNSPrefixLength = 8
+
+// hashLeaderHostname is the host name of a hash identity leader: the lws name
+// plus a prefix of the group key, the same shape as worker and ordinal names.
+func hashLeaderHostname(lwsName, groupUniqueKey string) string {
+	key := groupUniqueKey
+	if len(key) > HashDNSPrefixLength {
+		key = key[:HashDNSPrefixLength]
+	}
+	return fmt.Sprintf("%s-%s", lwsName, key)
 }
 
 // SetExclusiveAffinities set the pod affinity/anti-affinity
