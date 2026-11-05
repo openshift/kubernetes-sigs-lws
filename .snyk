@@ -1,0 +1,12 @@
+# Snyk (https://snyk.io) policy file
+
+version: v1.25.0
+
+# Exclude vendor, test files, and development/release tooling from scanning
+exclude:
+  global:
+    - vendor/**
+    - "**/*_test.go"
+    - pkg/utils/utils.go
+    - site/**
+    - hack/**
