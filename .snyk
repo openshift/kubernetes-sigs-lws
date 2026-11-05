@@ -1,8 +1,12 @@
-# References:
-# https://docs.snyk.io/scan-applications/snyk-code/using-snyk-code-from-the-cli/excluding-directories-and-files-from-the-snyk-code-cli-test
-# https://docs.snyk.io/snyk-cli/commands/ignore
+# Snyk (https://snyk.io) policy file
+
+version: v1.25.0
+
+# Exclude vendor, test files, and development/release tooling from scanning
 exclude:
   global:
     - vendor/**
     - "**/*_test.go"
-    - pkg/utils/utils.go # Sha1Hash function is only used to generate a unique name, not be used due to security purposes
+    - pkg/utils/utils.go
+    - site/**
+    - hack/**

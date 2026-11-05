@@ -1,5 +1,5 @@
 baseURL = "/"
-title = "LWS"
+title = "LeaderWorkerSet & DisaggregatedSet"
 
 enableRobotsTXT = true
 
@@ -89,7 +89,7 @@ ignoreFiles = []
   # The major.minor version tag for the version of the docs represented in this
   # branch of the repository. Used in the "version-banner" partial to display a
   # version number for this doc set.
-  version = "v0.9.0"
+  version = "v1.0.0"
 
   # Flag used in the "version-banner" partial to decide whether to display a
   # banner on every page indicating that this is an archived version of the docs.
@@ -111,6 +111,8 @@ ignoreFiles = []
 
   # User interface configuration
   [params.ui]
+    # Native Light / Dark / Auto menu, synchronized with the Canvas illustrations.
+    showLightDarkModeMenu = true
     # Enable the logo
     navbar_logo = true
     # Enable to show the side bar menu in its compact state.

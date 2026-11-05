@@ -1,5 +1,7 @@
 ---
 title: DisaggregatedSet API
+linkTitle: DisaggregatedSet API
+weight: 20
 content_type: tool-reference
 package: disaggregatedset.x-k8s.io/v1
 auto_generated: true
@@ -72,6 +74,14 @@ RolloutStrategy.RollingUpdateConfiguration.Partition must not be set).</p>
 </td>
 <td>
    <p>Name is the unique identifier for this role.</p>
+</td>
+</tr>
+<tr><td><code>subRoles</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec"><code>[]DisaggregatedSubRoleSpec</code></a>
+</td>
+<td>
+   <p>SubRoles partitions one LWS into pools sharing its templates.
+Child targets sum to parent replicas; omit parent scaling. Parent spec.replicas is ignored.</p>
 </td>
 </tr>
 <tr><td><code>scaling</code><br/>
@@ -216,10 +226,73 @@ revisions so HPA observes the serving fleet during a rolling update.</p>
 </td>
 </tr>
 <tr><td><code>conditions</code><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
 </td>
 <td>
    <p>Conditions expose scaler-level state (Ready).</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## `DisaggregatedSetScalingPolicy`     {#disaggregatedset-x-k8s-io-v1-DisaggregatedSetScalingPolicy}
+    
+
+**Appears in:**
+
+- [DisaggregatedSetSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedSetSpec)
+
+
+<p>DisaggregatedSetScalingPolicy configures how replica target changes interact
+with DisaggregatedSet reconciliation.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>scaleUpDuringRollout</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-RolloutScalingPolicy"><code>RolloutScalingPolicy</code></a>
+</td>
+<td>
+   <p>ScaleUpDuringRollout controls target growth while old revisions remain.
+Deferred preserves readiness-paced growth, without waiting for the entire
+rollout to finish. Immediate also tops up target replicas to desired minus
+replicas requested from all old revisions of the same role. Loading groups
+count, so readiness loss alone does not trigger extra growth.
+Old-revision retirement checks are unchanged.
+Renamed-role replacement limits still apply.</p>
+</td>
+</tr>
+<tr><td><code>scaleDownDuringRollout</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-RolloutScalingPolicy"><code>RolloutScalingPolicy</code></a>
+</td>
+<td>
+   <p>ScaleDownDuringRollout controls demand-driven target replica reductions.
+Deferred waits until old revisions finish draining. Immediate considers
+reductions during the rollout, preferring safe old-revision drains.
+Both policies allow scale-up and old-revision drains within rollout bounds.
+Deferred uses max(initial old replicas, effective desired) + maxSurge as
+the surge ceiling. External roles retain at least the target's current Spec
+as effective desired while old replicas of that role remain.
+Immediate uses desired + maxSurge as the surge ceiling and may shrink
+target replicas when old revisions must remain. Under both policies,
+reductions of roles still present preserve max(0, effective desired -
+maxUnavailable) Ready replicas, or avoid worsening an existing shortfall.
+Renamed-role surplus recovery uses the same availability and scheduled-startup
+protection as other target reductions. These safeguards may delay
+reductions: Immediate does not mean instant deletion.</p>
+</td>
+</tr>
+<tr><td><code>subRoleScaleDelaySeconds</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>SubRoleScaleDelaySeconds batches scale updates within a fixed window for LWS
+pools with multiple sub-roles and at least one External scaler. Defaults to 2
+seconds (range 0 to 60); zero disables it. Scaling from zero and rollouts bypass
+the delay. Controller restarts reset the window.</p>
 </td>
 </tr>
 </tbody>
@@ -235,9 +308,9 @@ revisions so HPA observes the serving fleet during a rolling update.</p>
 
 <p>DisaggregatedSetSpec defines the desired state of DisaggregatedSet.</p>
 <p>The all-or-nothing replicas rule (either every role has replicas &gt; 0, or
-every role has replicas == 0) applies only to non-External roles. External
-roles are exempt because their effective replicas live outside the DS spec —
-they are driven via DisaggregatedSetRoleScaler.spec.replicas.</p>
+every role has replicas == 0) applies only to non-External, unpartitioned
+roles. External targets come from scalers; sub-roles may independently scale
+to zero without pausing sibling routing pools.</p>
 
 
 <table class="table">
@@ -249,7 +322,7 @@ they are driven via DisaggregatedSetRoleScaler.spec.replicas.</p>
 <a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec"><code>[]DisaggregatedRoleSpec</code></a>
 </td>
 <td>
-   <p>Roles defines the list of roles (at least 2 required).
+   <p>Roles defines the list of roles (at least 1 required).
 Each role has a unique name and its own configuration.</p>
 </td>
 </tr>
@@ -260,6 +333,15 @@ Each role has a unique name and its own configuration.</p>
    <p>Slices is the number of independent copies of the whole role topology.
 Each slice is a complete set of all roles that rolls out independently.
 Changing Slices scales copies up or down and does not trigger a rollout.</p>
+</td>
+</tr>
+<tr><td><code>scalingPolicy</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-DisaggregatedSetScalingPolicy"><code>DisaggregatedSetScalingPolicy</code></a>
+</td>
+<td>
+   <p>ScalingPolicy controls scale-up and scale-down during rolling updates.
+Omit it to use Deferred for both directions: readiness-paced growth and
+target reductions after old revisions drain.</p>
 </td>
 </tr>
 <tr><td><code>placementPolicy</code><br/>
@@ -292,16 +374,24 @@ created, so changing it takes effect on the next rollout.</p>
 <tbody>
     
   
+<tr><td><code>observedGeneration</code><br/>
+<code>int64</code>
+</td>
+<td>
+   <p>observedGeneration is the most recent generation observed for this DisaggregatedSet.</p>
+</td>
+</tr>
 <tr><td><code>roleStatuses</code><br/>
 <a href="#disaggregatedset-x-k8s-io-v1-RoleStatus"><code>[]RoleStatus</code></a>
 </td>
 <td>
-   <p>RoleStatuses contains the status for each role.
-The order matches spec.roles.</p>
+   <p>RoleStatuses lists current parent roles in spec order, with nested sub-role statuses.
+Parent counts include historical layouts and may exceed the visible child sum.
+Removed roles are omitted even while their groups drain.</p>
 </td>
 </tr>
 <tr><td><code>conditions</code><br/>
-<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.37/#condition-v1-meta"><code>[]k8s.io/apimachinery/pkg/apis/meta/v1.Condition</code></a>
 </td>
 <td>
    <p>conditions represent the current state of the DisaggregatedSet resource.
@@ -310,9 +400,68 @@ Each condition has a unique type and reflects the status of a specific aspect of
 <ul>
 <li>&quot;Available&quot;: the resource is fully functional</li>
 <li>&quot;Progressing&quot;: the resource is being created or updated</li>
-<li>&quot;Degraded&quot;: the resource failed to reach or maintain its desired state</li>
 </ul>
 <p>The status of each condition is one of True, False, or Unknown.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## `DisaggregatedSubRoleSpec`     {#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec}
+    
+
+**Appears in:**
+
+- [DisaggregatedRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec)
+
+
+<p>DisaggregatedSubRoleSpec defines a scaling and routing pool sharing its parent's templates.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>Name is unique within the parent role.</p>
+</td>
+</tr>
+<tr><td><code>replicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>Replicas counts groups (Static default: 1); omit it for External scaling.</p>
+</td>
+</tr>
+<tr><td><code>scaling</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-RoleScaling"><code>RoleScaling</code></a>
+</td>
+<td>
+   <p>Scaling selects this pool's replica source.</p>
+</td>
+</tr>
+<tr><td><code>maxSurge</code><br/>
+<a href="https://pkg.go.dev/k8s.io/apimachinery/pkg/util/intstr#IntOrString"><code>k8s.io/apimachinery/pkg/util/intstr.IntOrString</code></a>
+</td>
+<td>
+   <p>MaxSurge overrides the parent's rollout surge budget for this sub-role.
+Accepts a non-negative integer or a percentage up to 100%, rounded up
+against this sub-role's replica target. Omitted values inherit the parent;
+with no parent rollout configuration, the default is 0.</p>
+</td>
+</tr>
+<tr><td><code>maxUnavailable</code><br/>
+<a href="https://pkg.go.dev/k8s.io/apimachinery/pkg/util/intstr#IntOrString"><code>k8s.io/apimachinery/pkg/util/intstr.IntOrString</code></a>
+</td>
+<td>
+   <p>MaxUnavailable overrides the parent's rollout unavailability budget for
+this sub-role. Accepts a non-negative integer or a percentage up to 100%,
+rounded down against this sub-role's replica target. Omitted values inherit
+the parent; with no parent rollout configuration, the default is 1. Zero is explicit.</p>
 </td>
 </tr>
 </tbody>
@@ -373,6 +522,8 @@ topologyKey. Required when Type is not None.</p>
 
 - [DisaggregatedRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedRoleSpec)
 
+- [DisaggregatedSubRoleSpec](#disaggregatedset-x-k8s-io-v1-DisaggregatedSubRoleSpec)
+
 
 <p>RoleScaling configures how replicas are determined for a role. Sub-struct
 (not a bare enum) so future per-role scaling policies can be added without
@@ -417,7 +568,7 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
 - [DisaggregatedSetStatus](#disaggregatedset-x-k8s-io-v1-DisaggregatedSetStatus)
 
 
-<p>RoleStatus defines the observed state of a single role.</p>
+<p>RoleStatus defines the observed state of a single parent role.</p>
 
 
 <table class="table">
@@ -429,7 +580,31 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
 <code>string</code>
 </td>
 <td>
-   <p>Name is the name of the role (matches spec.roles[].name).</p>
+   <p>Name is the parent role name.</p>
+</td>
+</tr>
+<tr><td><code>desiredReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>DesiredReplicas is the number of replicas the controller is driving this role
+toward, totalled across slices: its replicas, or the target of its
+DisaggregatedSetRoleScaler when its scaling mode is External. A partitioned
+role reports the sum of its sub-role targets. It is unset while any of those
+targets is unknown, for example before the scaler exists, so it is never
+mistaken for a requested zero. The Available condition is judged against it.</p>
+</td>
+</tr>
+<tr><td><code>minAvailableReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>MinAvailableReplicas is the availability floor of this role, totalled
+across slices: in each slice, desiredReplicas minus its resolved
+maxUnavailable, and never below zero. A partitioned role reports the sum
+of its sub-role floors. It is unset while any of those targets is unknown.
+The MinimumReplicasAvailable condition is judged against it. During a
+Deferred rollout the controller may protect more Ready replicas than this.</p>
 </td>
 </tr>
 <tr><td><code>replicas</code><br/>
@@ -443,7 +618,18 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
 <code>int32</code>
 </td>
 <td>
-   <p>ReadyReplicas is the number of ready replicas for this role.</p>
+   <p>ReadyReplicas is the number of ready replicas for this role.
+Sub-role readiness requires a coherent assignment across the whole group.</p>
+</td>
+</tr>
+<tr><td><code>availableReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>AvailableReplicas counts the Ready replicas that can serve requests: those
+in a revision of a slice in which every role that revision requires has
+at least one Ready replica. A Ready Prefill cannot serve without a Ready
+Decode of the same revision and slice. It never exceeds ReadyReplicas.</p>
 </td>
 </tr>
 <tr><td><code>updatedReplicas</code><br/>
@@ -451,6 +637,106 @@ inline spec.replicas; External uses the auto-created scaler CR.</p>
 </td>
 <td>
    <p>UpdatedReplicas is the number of replicas updated to the latest revision.</p>
+</td>
+</tr>
+<tr><td><code>subRoleStatuses</code><br/>
+<a href="#disaggregatedset-x-k8s-io-v1-SubRoleStatus"><code>[]SubRoleStatus</code></a>
+</td>
+<td>
+   <p>SubRoleStatuses lists the current sub-roles in spec order.
+Removed sub-roles are omitted, but their groups remain in the parent counts
+while draining. Do not add child counts to their parent aggregate.</p>
+</td>
+</tr>
+</tbody>
+</table>
+
+## `RolloutScalingPolicy`     {#disaggregatedset-x-k8s-io-v1-RolloutScalingPolicy}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [DisaggregatedSetScalingPolicy](#disaggregatedset-x-k8s-io-v1-DisaggregatedSetScalingPolicy)
+
+
+<p>RolloutScalingPolicy controls when a replica target change is applied during
+a rolling update. The scale-up and scale-down fields select it independently.</p>
+
+
+
+
+## `SubRoleStatus`     {#disaggregatedset-x-k8s-io-v1-SubRoleStatus}
+    
+
+**Appears in:**
+
+- [RoleStatus](#disaggregatedset-x-k8s-io-v1-RoleStatus)
+
+
+<p>SubRoleStatus defines the observed state of a sub-role within its parent.</p>
+
+
+<table class="table">
+<thead><tr><th width="30%">Field</th><th>Description</th></tr></thead>
+<tbody>
+    
+  
+<tr><td><code>name</code> <B>[Required]</B><br/>
+<code>string</code>
+</td>
+<td>
+   <p>Name is the sub-role name, without the parent prefix.</p>
+</td>
+</tr>
+<tr><td><code>desiredReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>DesiredReplicas is the number of replica groups the controller is driving
+this sub-role toward, totalled across slices: its replicas, or the target of
+its DisaggregatedSetRoleScaler when its scaling mode is External. It is unset
+while that target is unknown.</p>
+</td>
+</tr>
+<tr><td><code>minAvailableReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>MinAvailableReplicas is the availability floor of this sub-role, totalled
+across slices: in each slice, desiredReplicas minus its resolved
+maxUnavailable, and never below zero. It is unset while desiredReplicas is
+unknown. The MinimumReplicasAvailable condition is judged against it.</p>
+</td>
+</tr>
+<tr><td><code>replicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>Replicas is the number of replica groups assigned to this sub-role.</p>
+</td>
+</tr>
+<tr><td><code>readyReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>ReadyReplicas counts Ready groups with a coherent whole-group assignment.</p>
+</td>
+</tr>
+<tr><td><code>availableReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>AvailableReplicas counts the Ready groups that can serve requests: those
+in a revision of a slice in which every role that revision requires has
+at least one Ready group. It never exceeds ReadyReplicas.</p>
+</td>
+</tr>
+<tr><td><code>updatedReplicas</code><br/>
+<code>int32</code>
+</td>
+<td>
+   <p>UpdatedReplicas counts groups belonging to the latest revision.</p>
 </td>
 </tr>
 </tbody>

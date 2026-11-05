@@ -1,6 +1,7 @@
 ---
 title: "Labels, Annotations and Environment Variables"
 linkTitle: "Labels, Annotations and Environment Variables"
+weight: 30
 date: 2025-03-14
 description:  A reference for all labels, annotations, and environment variables in LWS.
 ---
@@ -9,17 +10,18 @@ description:  A reference for all labels, annotations, and environment variables
 
 | Key                                                  | Description                                                                       | Example                        | Applies to                     |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------ | ------------------------------ |
-| `leaderworkerset.sigs.k8s.io/name`                   | The name of the LeaderWorkerSet object to which these resources belong.           | leaderworkerset-multi-template | Pod, StatefulSet, Service      |
-| `leaderworkerset.sigs.k8s.io/template-revision-hash` | Hash used to track the controller revision that matches a LeaderWorkerSet object. | 5c5fcdfb44                     | Pod, StatefulSet               |
-| `leaderworkerset.sigs.k8s.io/group-index`            | The group to which it belongs.                                                    | 0                              | Pod, StatefulSet (only worker) |
+| `leaderworkerset.sigs.k8s.io/name`                   | The name of the LeaderWorkerSet object to which these resources belong.           | leaderworkerset-multi-template | Pod, StatefulSet, Service, ComputeDomain |
+| `leaderworkerset.sigs.k8s.io/template-revision-hash` | Hash used to track the controller revision that matches a LeaderWorkerSet object. | 5c5fcdfb44                     | Pod, StatefulSet, ComputeDomain |
+| `leaderworkerset.sigs.k8s.io/group-index`            | The group to which it belongs.                                                    | 0                              | Pod, StatefulSet (only worker), ComputeDomain |
 | `leaderworkerset.sigs.k8s.io/group-key`              | Unique key identifying the group.                                                 | 689ce1b5...b07                 | Pod, StatefulSet (only worker) |
 | `leaderworkerset.sigs.k8s.io/worker-index`           | The index or identity of the pod within the group.                                | 0                              | Pod                            |
 | `leaderworkerset.sigs.k8s.io/subgroup-index`         | Tracks which subgroup the pod is part of.                                         | 0                              | Pod (only if SubGroup is set)  |
 | `leaderworkerset.sigs.k8s.io/subgroup-key`           | Pods that are part of the same subgroup will have the same unique hash value.     | 92904e74...801                 | Pod (only if SubGroup is set)  |
-| `disaggregatedset.x-k8s.io/name`                     | The name of the DisaggregatedSet object to which these resources belong.          | disaggregatedset-sample        | LeaderWorkerSet, Service, Pod  |
+| `disaggregatedset.x-k8s.io/name`                     | The name of the DisaggregatedSet object to which these resources belong.          | disaggregatedset-sample        | LeaderWorkerSet, Service, Pod, ComputeDomain |
 | `disaggregatedset.x-k8s.io/role`                     | The DisaggregatedSet role for the resource.                                       | prefill                        | LeaderWorkerSet, Service, Pod  |
-| `disaggregatedset.x-k8s.io/slice`                    | Slice index for the resource within the DisaggregatedSet.                         | 0                              | LeaderWorkerSet, Service, Pod  |
-| `disaggregatedset.x-k8s.io/revision`                 | Revision hash used to track a DisaggregatedSet rollout.                           | a1b2c3d4                       | LeaderWorkerSet, Service, Pod  |
+| `disaggregatedset.x-k8s.io/slice`                    | Slice index for the resource within the DisaggregatedSet.                         | 0                              | LeaderWorkerSet, Service, Pod, ComputeDomain |
+| `disaggregatedset.x-k8s.io/revision`                 | Revision hash used to track a DisaggregatedSet rollout.                           | a1b2c3d4                       | LeaderWorkerSet, Service, Pod, ComputeDomain |
+| `leaderworkerset.sigs.k8s.io/compute-domain-owner-uid` | UID of the managing LeaderWorkerSet or DisaggregatedSet (`AutoComputeDomain`).  | 11111111-...-111111111111      | ComputeDomain                  |
 
 # Annotations
 
@@ -33,18 +35,32 @@ description:  A reference for all labels, annotations, and environment variables
 | `leaderworkerset.sigs.k8s.io/subgroup-size`               | The number of pods per subgroup.                                       | 2                                | Pod (only if SubGroup is set)                                                          |
 | `leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology` | Specifies the topology for exclusive 1:1 scheduling within a subgroup. | topologyKey                      | LeaderWorkerSet, Pod (only if SubGroup is set and subgroup-exclusive-topology is used) |
 | `leaderworkerset.sigs.k8s.io/leader-requests-tpus`        | Indicates if the leader pod requests TPU.                              | true                             | Pod (only if leader pod requests TPU)                                                  |
-| `disaggregatedset.x-k8s.io/initial-replicas`              | Initial replica count captured when a DisaggregatedSet rollout starts. | 2                                | LeaderWorkerSet                                                                         |
+| `leaderworkerset.sigs.k8s.io/group-restart-counts`        | Stores restart budget consumed by each revision and replica group.     | `{"abc123/0":3}`                 | LeaderWorkerSet (only if maxGroupRestarts is set)                                      |
+| `leaderworkerset.sigs.k8s.io/group-restart-budget-exhausted` | Marks the retained leader after its group exhausts its restart budget. | true                             | Pod (only leader)                                                                      |
+| `leaderworkerset.sigs.k8s.io/recover`                     | Set to `true` on a retained leader to explicitly recover its exhausted group. | true                       | Pod (only an exhausted leader)                                                         |
+| `disaggregatedset.x-k8s.io/initial-replicas`              | Replica baseline used by the controller when the DisaggregatedSet revision becomes old. | 2                    | LeaderWorkerSet                                                                         |
+| `leaderworkerset.sigs.k8s.io/auto-compute-domain`         | Enables or disables per-replica automatic NVIDIA DRA ComputeDomain management (`enabled` / `disabled`). | enabled  | LeaderWorkerSet, DisaggregatedSet role                                                 |
+| `disaggregatedset.x-k8s.io/auto-compute-domain`           | Enables or disables per-slice automatic NVIDIA DRA ComputeDomain management (`enabled` / `disabled`).   | enabled  | DisaggregatedSet, DisaggregatedSet role                                                |
+| `leaderworkerset.sigs.k8s.io/compute-domain-containers`   | Comma-separated container names to inject the ComputeDomain DRA claim into. | vllm                         | PodTemplateSpec (`leaderTemplate`, `workerTemplate`)                                   |
+| `leaderworkerset.sigs.k8s.io/compute-domain-prefix`       | Controller-managed prefix (`<lwsName>-<uid5>`) used by the pod webhook to derive replica ComputeDomain names. | deepseek-r1-391a8 | PodTemplateSpec (leader)                                                        |
+| `leaderworkerset.sigs.k8s.io/compute-domain-name`         | Controller-managed ComputeDomain name shared by a replica's leader and worker pods. | deepseek-r1-391a8-abc-0-x7k9p | Pod (leader), PodTemplateSpec (worker)                                          |
 
 # Environment Variables
 
-| Key                    | Description                                         | Example                                                                                         | Applies to                |
-| ---------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------- |
-| `LWS_LEADER_ADDRESS`   | The address of the leader via the headless service. | leaderworkerset-multi-template-0.leaderworkerset-multi-template.default                         | Pod                       |
-| `LWS_GROUP_SIZE`       | Tracks the size of the LWS group.                   | 4                                                                                               | Pod                       |
-| `LWS_WORKER_INDEX`     | The index or identity of the pod within the group.  | 2                                                                                               | Pod                       |
-| `TPU_WORKER_HOSTNAMES` | Hostnames of TPU workers only in the same subgroup. | test-sample-1-5.default,test-sample-1-6.default,test-sample-1-7.default,test-sample-1-8.default | Pod (only if TPU enabled) |
-| `TPU_WORKER_ID`        | ID of the TPU worker.                               | 0                                                                                               | Pod (only if TPU enabled) |
-| `TPU_NAME`             | Name of the TPU.                                    | test-sample-1                                                                                   | Pod (only if TPU enabled) |
+| Key                          | Description                                                    | Example                                                                                         | Applies to                         |
+| ---------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------- |
+| `LWS_LEADER_ADDRESS`         | The address of the leader via the headless service.            | leaderworkerset-multi-template-0.leaderworkerset-multi-template.default                         | Pod                                |
+| `LWS_GROUP_SIZE`             | Tracks the size of the LWS group.                              | 4                                                                                               | Pod                                |
+| `LWS_WORKER_INDEX`           | The index or identity of the pod within the group.             | 2                                                                                               | Pod                                |
+| `DISAGGREGATEDSET_NAME`      | The name of the parent DisaggregatedSet.                       | disaggregatedset-sample                                                                        | Pod (only if managed by a DisaggregatedSet) |
+| `DISAGGREGATEDSET_ROLE`      | The role of the pod within the DisaggregatedSet.               | prefill                                                                                         | Pod (only if managed by a DisaggregatedSet) |
+| `DISAGGREGATEDSET_SLICE`     | The slice index of the pod within the DisaggregatedSet.        | 0                                                                                               | Pod (only if managed by a DisaggregatedSet) |
+| `DISAGGREGATEDSET_REVISION`  | The revision hash used to identify the DisaggregatedSet rollout. | a1b2c3d4                                                                                      | Pod (only if managed by a DisaggregatedSet) |
+| `TPU_WORKER_HOSTNAMES`       | Comma-separated DNS hostnames of TPU workers in the group (or subgroup when `subGroupPolicy` is set). | test-sample-1-5.default,test-sample-1-6.default,test-sample-1-7.default,test-sample-1-8.default | Pod (only if TPU enabled)          |
+| `TPU_PROCESS_ADDRESSES`      | Comma-separated `<hostname>:<port>` coordination endpoints matching `TPU_WORKER_HOSTNAMES`. | test-sample-1-5.default:8476,test-sample-1-6.default:8476,test-sample-1-7.default:8476,test-sample-1-8.default:8476 | Pod (only if TPU enabled)          |
+| `TPU_PROCESS_PORT`           | Coordination port for the TPU container (defaults to `8476`).  | 8476                                                                                            | Pod (only if TPU enabled)          |
+| `TPU_WORKER_ID`              | Zero-based ID of the TPU worker in the group (or subgroup).    | 0                                                                                               | Pod (only if TPU enabled)          |
+| `TPU_NAME`                   | Leader hostname identifying the TPU group.                     | test-sample-1                                                                                   | Pod (only if TPU enabled)          |
 
-If you want to use more environment variables, they are available in the labels or annotations but not listed in the Environment Variables section.
-We can obtain the index by using the [Downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/) to pass the Pod's label as an environment variable to the container.
+Other labels and annotations can be exposed to a container with the
+[Downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/).

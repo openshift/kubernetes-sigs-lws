@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,6 +52,9 @@ func TestVolcanoProvider_CreatePodGroupIfNotExists(t *testing.T) {
 	testLeaderPod2 := createTestLeaderPod("test-lws-1", "default", "test-lws", "1", "def456")
 	testLeaderPod3 := createTestLeaderPod("test-lws-0", "default", "test-lws", "0", "xyz789")
 	testLeaderPod4 := createTestLeaderPod("test-lws-2", "default-1", "test-lws-1", "2", "jkl012")
+	staleLeaderPod := createTestLeaderPod("test-lws-0", "default", "test-lws", "0", "stale123")
+	staleLeaderPod.UID = "old-test-lws-0"
+	deletionTimestamp := metav1.Now()
 
 	tests := []struct {
 		name           string
@@ -59,6 +63,8 @@ func TestVolcanoProvider_CreatePodGroupIfNotExists(t *testing.T) {
 		existingPG     *volcanov1beta1.PodGroup
 		injectGetError error
 		expectError    bool
+		expectErrorIs  error
+		expectExists   bool
 		expectedPG     *volcanov1beta1.PodGroup
 	}{
 		{
@@ -147,14 +153,144 @@ func TestVolcanoProvider_CreatePodGroupIfNotExists(t *testing.T) {
 			},
 			leaderPod: testLeaderPod3,
 			existingPG: &volcanov1beta1.PodGroup{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-lws-0-xyz789", Namespace: "default"},
-				Spec:       volcanov1beta1.PodGroupSpec{MinMember: 3},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-lws-0-xyz789",
+					Namespace: "default",
+					Labels: map[string]string{
+						leaderworkerset.GroupIndexLabelKey: "0",
+						leaderworkerset.SetNameLabelKey:    "test-lws",
+						leaderworkerset.RevisionKey:        "xyz789",
+					},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(testLeaderPod3, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
 			},
 			expectError: false,
 			expectedPG: &volcanov1beta1.PodGroup{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-lws-0-xyz789", Namespace: "default"},
-				Spec:       volcanov1beta1.PodGroupSpec{MinMember: 3},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-lws-0-xyz789",
+					Namespace: "default",
+					Labels: map[string]string{
+						leaderworkerset.GroupIndexLabelKey: "0",
+						leaderworkerset.SetNameLabelKey:    "test-lws",
+						leaderworkerset.RevisionKey:        "xyz789",
+					},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(testLeaderPod3, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
 			},
+		},
+		{
+			name: "wait for stale podgroup owned by previous leader pod to be deleted",
+			lws: &leaderworkerset.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+				Spec: leaderworkerset.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+				},
+			},
+			leaderPod: testLeaderPod3,
+			existingPG: &volcanov1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-lws-0-xyz789",
+					Namespace: "default",
+					Labels: map[string]string{
+						leaderworkerset.GroupIndexLabelKey: "0",
+						leaderworkerset.SetNameLabelKey:    "test-lws",
+						leaderworkerset.RevisionKey:        "xyz789",
+					},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(staleLeaderPod, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+			},
+			expectError:  true,
+			expectExists: true,
+		},
+		{
+			name: "return error without deleting podgroup owned by unexpected object",
+			lws: &leaderworkerset.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+				Spec: leaderworkerset.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+				},
+			},
+			leaderPod: testLeaderPod3,
+			existingPG: &volcanov1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-lws-0-xyz789",
+					Namespace: "default",
+					Labels: map[string]string{
+						leaderworkerset.GroupIndexLabelKey: "0",
+						leaderworkerset.SetNameLabelKey:    "test-lws",
+						leaderworkerset.RevisionKey:        "xyz789",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: leaderworkerset.GroupVersion.String(),
+							Kind:       "LeaderWorkerSet",
+							Name:       "test-lws",
+							UID:        "test-lws",
+							Controller: ptr.To(true),
+						},
+					},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+			},
+			expectError:   true,
+			expectErrorIs: ErrUnexpectedPodGroupOwner,
+			expectExists:  true,
+		},
+		{
+			name: "podgroup already exists with current owner and no labels",
+			lws: &leaderworkerset.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+				Spec: leaderworkerset.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+				},
+			},
+			leaderPod: testLeaderPod3,
+			existingPG: &volcanov1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "test-lws-0-xyz789",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(testLeaderPod3, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+			},
+			expectError: false,
+			expectedPG: &volcanov1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "test-lws-0-xyz789",
+					Namespace:       "default",
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(testLeaderPod3, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+			},
+		},
+		{
+			name: "requeue while podgroup is being deleted",
+			lws: &leaderworkerset.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+				Spec: leaderworkerset.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+				},
+			},
+			leaderPod: testLeaderPod3,
+			existingPG: &volcanov1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-lws-0-xyz789",
+					Namespace:         "default",
+					DeletionTimestamp: &deletionTimestamp,
+					Finalizers:        []string{"volcano.sh/test"},
+					Labels: map[string]string{
+						leaderworkerset.GroupIndexLabelKey: "0",
+						leaderworkerset.SetNameLabelKey:    "test-lws",
+						leaderworkerset.RevisionKey:        "xyz789",
+					},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(testLeaderPod3, corev1.SchemeGroupVersion.WithKind("Pod"))},
+				},
+				Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+			},
+			expectError: true,
 		},
 		{
 			name: "create podgroup inherit volcano annotations",
@@ -241,8 +377,19 @@ func TestVolcanoProvider_CreatePodGroupIfNotExists(t *testing.T) {
 
 			if tt.expectError {
 				assert.Error(t, err)
+				if tt.expectErrorIs != nil {
+					assert.ErrorIs(t, err, tt.expectErrorIs)
+				} else {
+					assert.NotErrorIs(t, err, ErrUnexpectedPodGroupOwner)
+				}
 				if tt.injectGetError != nil {
 					assert.Equal(t, tt.injectGetError, err)
+				}
+				if tt.expectExists {
+					var actualPG volcanov1beta1.PodGroup
+					pgName := tt.leaderPod.Annotations[volcanov1beta1.KubeGroupNameAnnotationKey]
+					err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: pgName, Namespace: tt.lws.Namespace}, &actualPG)
+					assert.NoError(t, err)
 				}
 				return
 			}
@@ -265,6 +412,147 @@ func TestVolcanoProvider_CreatePodGroupIfNotExists(t *testing.T) {
 	}
 }
 
+func TestVolcanoProvider_PodGroupAnnotation(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		scheduler       string
+		workerScheduler string
+		typedScheduling bool
+		annotated       bool
+		wantError       bool
+	}{
+		{name: "existing default scheduler pod", scheduler: corev1.DefaultSchedulerName},
+		{name: "existing KAI pod", scheduler: "kai-scheduler"},
+		{name: "Volcano requires group annotation", scheduler: string(Volcano), wantError: true},
+		{name: "Volcano workers require group annotation", scheduler: corev1.DefaultSchedulerName, workerScheduler: string(Volcano), wantError: true},
+		{name: "typed scheduling requires group annotation", scheduler: corev1.DefaultSchedulerName, typedScheduling: true, wantError: true},
+		{name: "annotated KAI pod still gets a PodGroup", scheduler: "kai-scheduler", annotated: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			lws := &leaderworkerset.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+				Spec: leaderworkerset.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](2)},
+				},
+			}
+			if tt.typedScheduling {
+				lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{}
+			}
+			lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.SchedulerName = tt.workerScheduler
+			leader := createTestLeaderPod("test-lws-0", lws.Namespace, lws.Name, "0", "rev1")
+			leader.Spec.SchedulerName = tt.scheduler
+			groupName := leader.Annotations[volcanov1beta1.KubeGroupNameAnnotationKey]
+			if !tt.annotated {
+				delete(leader.Annotations, volcanov1beta1.KubeGroupNameAnnotationKey)
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(leader).Build()
+			require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(leader), leader))
+			before := leader.DeepCopy()
+
+			err := NewVolcanoProvider(fakeClient).CreatePodGroupIfNotExists(ctx, lws, leader)
+			if tt.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, before, leader)
+			var stored corev1.Pod
+			require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(leader), &stored))
+			assert.Equal(t, before, &stored)
+			var groups volcanov1beta1.PodGroupList
+			require.NoError(t, fakeClient.List(ctx, &groups))
+			if tt.annotated {
+				require.Len(t, groups.Items, 1)
+				assert.Equal(t, groupName, groups.Items[0].Name)
+			} else {
+				assert.Empty(t, groups.Items)
+			}
+		})
+	}
+}
+
+func TestVolcanoProvider_RecreatesPodGroupAfterGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	lws := &leaderworkerset.LeaderWorkerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+		Spec: leaderworkerset.LeaderWorkerSetSpec{
+			LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+		},
+	}
+	leaderPod := createTestLeaderPod("test-lws-0", "default", "test-lws", "0", "abc123")
+	previousLeaderPod := leaderPod.DeepCopy()
+	previousLeaderPod.UID = "previous-leader"
+	pgName := leaderPod.Annotations[volcanov1beta1.KubeGroupNameAnnotationKey]
+	stalePG := &volcanov1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            pgName,
+			Namespace:       lws.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(previousLeaderPod, corev1.SchemeGroupVersion.WithKind("Pod"))},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stalePG).Build()
+	provider := NewVolcanoProvider(fakeClient)
+
+	err := provider.CreatePodGroupIfNotExists(ctx, lws, leaderPod)
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, ErrUnexpectedPodGroupOwner)
+	var actualPG volcanov1beta1.PodGroup
+	assert.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: pgName, Namespace: lws.Namespace}, &actualPG))
+
+	assert.NoError(t, fakeClient.Delete(ctx, &actualPG)) // Simulate owner-reference garbage collection.
+	assert.NoError(t, provider.CreatePodGroupIfNotExists(ctx, lws, leaderPod))
+	assert.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: pgName, Namespace: lws.Namespace}, &actualPG))
+
+	owner := metav1.GetControllerOf(&actualPG)
+	if assert.NotNil(t, owner) {
+		assert.Equal(t, leaderPod.UID, owner.UID)
+	}
+}
+
+// TestVolcanoProvider_CreatePodGroupIfNotExists_TypedSchedulingIsNoop reproduces
+// https://github.com/kubernetes-sigs/lws/issues/1075: with spec.scheduling set,
+// ReconcileScheduling has already pre-created a PodGroup controlled by the
+// LeaderWorkerSet itself, before any leader Pod exists. CreatePodGroupIfNotExists
+// must not treat that LWS-owned PodGroup as an unexpected owner and block worker
+// creation; it must leave PodGroup ownership to ReconcileScheduling entirely.
+func TestVolcanoProvider_CreatePodGroupIfNotExists_TypedSchedulingIsNoop(t *testing.T) {
+	ctx := context.Background()
+	lws := &leaderworkerset.LeaderWorkerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+		Spec: leaderworkerset.LeaderWorkerSetSpec{
+			LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](3)},
+			Scheduling:           &leaderworkerset.LeaderWorkerSetScheduling{},
+		},
+	}
+	leaderPod := createTestLeaderPod("test-lws-0", "default", "test-lws", "0", "abc123")
+	pgName := leaderPod.Annotations[volcanov1beta1.KubeGroupNameAnnotationKey]
+	lwsOwnedPG := &volcanov1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            pgName,
+			Namespace:       lws.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))},
+		},
+		Spec: volcanov1beta1.PodGroupSpec{MinMember: 3},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lwsOwnedPG).Build()
+	provider := NewVolcanoProvider(fakeClient)
+
+	assert.NoError(t, provider.CreatePodGroupIfNotExists(ctx, lws, leaderPod))
+
+	// The LWS-owned PodGroup must be left untouched: still owned by the
+	// LeaderWorkerSet, not reassigned or recreated under the leader Pod.
+	var actualPG volcanov1beta1.PodGroup
+	assert.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Name: pgName, Namespace: lws.Namespace}, &actualPG))
+	owner := metav1.GetControllerOf(&actualPG)
+	if assert.NotNil(t, owner) {
+		assert.Equal(t, "LeaderWorkerSet", owner.Kind)
+		assert.Equal(t, lws.UID, owner.UID)
+	}
+}
+
 // Helper function to create test leader pods
 func createTestLeaderPod(name, namespace, lwsName, groupIndex, revision string) *corev1.Pod {
 	return &corev1.Pod{
@@ -282,4 +570,159 @@ func createTestLeaderPod(name, namespace, lwsName, groupIndex, revision string) 
 			},
 		},
 	}
+}
+
+// TestVolcanoProviderReconcileSchedulingGroupIdentity covers both identity
+// TestVolcanoProviderReconcileSchedulingGroupIdentity pins the contract between
+// the LWS-level scheduling pass and the leader-pod pass across groupIdentity
+// modes: both Ordinal and Hash defer replica PodGroup creation to the leader-pod
+// pass (CreatePodGroupIfNotExists) while the leader pod is scheduling-gated.
+func TestVolcanoProviderReconcileSchedulingGroupIdentity(t *testing.T) {
+	ctx := context.Background()
+	newLWS := func(identity leaderworkerset.GroupIdentityType) *leaderworkerset.LeaderWorkerSet {
+		return &leaderworkerset.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+			Spec: leaderworkerset.LeaderWorkerSetSpec{
+				Replicas:      ptr.To[int32](2),
+				GroupIdentity: identity,
+				Scheduling:    &leaderworkerset.LeaderWorkerSetScheduling{},
+				LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+					WorkerTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "worker", Image: "worker:latest"}},
+					}},
+				},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		identity leaderworkerset.GroupIdentityType
+	}{
+		{name: "ordinal defers PodGroups to the leader pods", identity: leaderworkerset.GroupIdentityOrdinal},
+		{name: "hash defers PodGroups to the leader pods", identity: leaderworkerset.GroupIdentityHash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lws := newLWS(tc.identity)
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+
+			err := NewVolcanoProvider(fakeClient).ReconcileScheduling(ctx, lws, 2, "revision-1")
+			assert.NoError(t, err)
+
+			groups := &volcanov1beta1.PodGroupList{}
+			assert.NoError(t, fakeClient.List(ctx, groups, client.InNamespace(lws.Namespace)))
+			assert.Empty(t, groups.Items)
+		})
+	}
+}
+
+func TestVolcanoProviderCreatePodGroupIfNotExistsOwnership(t *testing.T) {
+	ctx := context.Background()
+	newLWS := func(identity leaderworkerset.GroupIdentityType, typedScheduling bool) *leaderworkerset.LeaderWorkerSet {
+		lws := &leaderworkerset.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default", UID: "lws-uid-123"},
+			Spec: leaderworkerset.LeaderWorkerSetSpec{
+				Replicas:      ptr.To[int32](2),
+				GroupIdentity: identity,
+				LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+					WorkerTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "worker", Image: "worker:latest"}},
+					}},
+				},
+			},
+		}
+		if typedScheduling {
+			lws.Spec.Scheduling = &leaderworkerset.LeaderWorkerSetScheduling{}
+		}
+		return lws
+	}
+
+	// Hash groups never reuse a name, so an LWS-owned PodGroup would outlive its
+	// group. The leader owns it instead and it is garbage collected with it.
+	t.Run("hash identity with typed scheduling creates leader-owned PodGroup", func(t *testing.T) {
+		lws := newLWS(leaderworkerset.GroupIdentityHash, true)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+		provider := NewVolcanoProvider(fakeClient)
+
+		leader := createTestLeaderPod("leader-hash", lws.Namespace, lws.Name, "hash123", "rev1")
+		err := provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+		assert.NoError(t, err)
+
+		pg := &volcanov1beta1.PodGroup{}
+		err = fakeClient.Get(ctx, types.NamespacedName{Name: GetPodGroupName(lws.Name, "hash123", "rev1"), Namespace: lws.Namespace}, pg)
+		assert.NoError(t, err)
+
+		owner := metav1.GetControllerOf(pg)
+		assert.NotNil(t, owner)
+		assert.Equal(t, "Pod", owner.Kind)
+		assert.Equal(t, leader.Name, owner.Name)
+		assert.Equal(t, leader.UID, owner.UID)
+
+		// Subsequent call succeeds idempotently.
+		err = provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+		assert.NoError(t, err)
+	})
+
+	t.Run("hash identity accepts LWS-owned PodGroup from earlier releases", func(t *testing.T) {
+		lws := newLWS(leaderworkerset.GroupIdentityHash, true)
+		leader := createTestLeaderPod("leader-hash", lws.Namespace, lws.Name, "hash123", "rev1")
+		pg := &volcanov1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+			Name:            GetPodGroupName(lws.Name, "hash123", "rev1"),
+			Namespace:       lws.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(lws, leaderworkerset.GroupVersion.WithKind("LeaderWorkerSet"))},
+		}}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws, pg).Build()
+		provider := NewVolcanoProvider(fakeClient)
+
+		assert.NoError(t, provider.CreatePodGroupIfNotExists(ctx, lws, leader))
+	})
+
+	t.Run("ordinal identity with typed scheduling creates LWS-owned PodGroup", func(t *testing.T) {
+		lws := newLWS(leaderworkerset.GroupIdentityOrdinal, true)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+		provider := NewVolcanoProvider(fakeClient)
+
+		err := provider.ReconcileScheduling(ctx, lws, 2, "rev1")
+		assert.NoError(t, err)
+
+		leader := createTestLeaderPod("leader-0", lws.Namespace, lws.Name, "0", "rev1")
+		err = provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+		assert.NoError(t, err)
+
+		pg := &volcanov1beta1.PodGroup{}
+		err = fakeClient.Get(ctx, types.NamespacedName{Name: GetPodGroupName(lws.Name, "0", "rev1"), Namespace: lws.Namespace}, pg)
+		assert.NoError(t, err)
+
+		owner := metav1.GetControllerOf(pg)
+		assert.NotNil(t, owner)
+		assert.Equal(t, "LeaderWorkerSet", owner.Kind)
+		assert.Equal(t, lws.Name, owner.Name)
+		assert.Equal(t, lws.UID, owner.UID)
+
+		// Subsequent call succeeds idempotently.
+		err = provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+		assert.NoError(t, err)
+	})
+
+	t.Run("legacy mode creates leader-pod-owned PodGroup", func(t *testing.T) {
+		lws := newLWS(leaderworkerset.GroupIdentityOrdinal, false)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(lws).Build()
+		provider := NewVolcanoProvider(fakeClient)
+
+		leader := createTestLeaderPod("leader-0", lws.Namespace, lws.Name, "0", "rev1")
+		err := provider.CreatePodGroupIfNotExists(ctx, lws, leader)
+		assert.NoError(t, err)
+
+		pg := &volcanov1beta1.PodGroup{}
+		err = fakeClient.Get(ctx, types.NamespacedName{Name: GetPodGroupName(lws.Name, "0", "rev1"), Namespace: lws.Namespace}, pg)
+		assert.NoError(t, err)
+
+		owner := metav1.GetControllerOf(pg)
+		assert.NotNil(t, owner)
+		assert.Equal(t, "Pod", owner.Kind)
+		assert.Equal(t, leader.Name, owner.Name)
+		assert.Equal(t, leader.UID, owner.UID)
+	})
 }

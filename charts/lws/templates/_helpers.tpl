@@ -65,12 +65,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Create the name of the service account to use
+Name of the controller manager service account
 */}}
 {{- define "lws.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "lws.fullname" .) .Values.serviceAccount.name }}
+{{- $serviceAccount := .Values.serviceAccount | default dict -}}
+{{- default (printf "%s-controller-manager" (include "lws.fullname" .)) $serviceAccount.name }}
+{{- end }}
+
+{{/*
+Controller manager image reference. A digest, when set, takes precedence over the tag.
+*/}}
+{{- define "lws.image" -}}
+{{- $image := .Values.image.manager }}
+{{- if $image.digest }}
+{{- printf "%v@%s" $image.repository $image.digest }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- printf "%v:%v" $image.repository (default .Chart.AppVersion $image.tag) }}
 {{- end }}
 {{- end }}

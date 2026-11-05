@@ -157,13 +157,20 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("verifying LWS resources are created for both roles")
 			Eventually(func(g Gomega) {
-				g.Expect(kubectl.CountLWSByRole(deploymentName, "prefill")).To(Equal(1))
-				g.Expect(kubectl.CountLWSByRole(deploymentName, "decode")).To(Equal(1))
+				count, err := kubectl.CountLWSByRole(deploymentName, "prefill")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal(1))
+
+				count, err = kubectl.CountLWSByRole(deploymentName, "decode")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal(1))
 			}, 60*time.Second, time.Second).Should(Succeed())
 
 			By("verifying pods become ready")
 			Eventually(func(g Gomega) {
-				g.Expect(kubectl.CountRunningPods(deploymentName)).To(Equal(2))
+				count, err := kubectl.CountRunningPods(deploymentName)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(count).To(Equal(2))
 			}, 90*time.Second, time.Second).Should(Succeed())
 		})
 	})
@@ -187,7 +194,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			By("waiting for initial deployment to stabilize")
 			kubectl.ForRunningPodCount(deploymentName, 4)
 
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("triggering rolling update by changing image")
@@ -247,7 +255,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			By("waiting for initial deployment to stabilize")
 			kubectl.ForRunningPodCount(deploymentName, 8)
 
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("triggering rolling update by changing image")
@@ -298,70 +307,6 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("verifying scale down")
 			kubectl.ForPodCount(deploymentName, 2)
-		})
-	})
-
-	Context("Service Creation", func() {
-		const deploymentName = "test-service"
-
-		AfterEach(func() {
-			kubectl.CleanupDeployment(deploymentName)
-		})
-
-		It("should create headless portless private services automatically", func() {
-			By("creating DisaggregatedSet")
-			yaml := fixtures.PrefillDecode(deploymentName,
-				fixtures.Role{Replicas: 1},
-				fixtures.Role{Replicas: 1},
-			).YAML()
-			Expect(applyYAML(yaml)).To(Succeed())
-
-			By("waiting for pods to be ready")
-			kubectl.ForRunningPodCount(deploymentName, 2)
-
-			By("verifying headless portless services are created for both roles")
-			for _, role := range []string{"prefill", "decode"} {
-				Eventually(func(g Gomega) {
-					// Check service is headless
-					output, err := kubectl.ServiceByRole(deploymentName, role).
-						JSONPath("{.items[0].spec.clusterIP}").Run()
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(strings.TrimSpace(output)).To(Equal("None"), "%s service should be headless", role)
-
-					// Check service has no ports
-					output, err = kubectl.ServiceByRole(deploymentName, role).
-						JSONPath("{.items[0].spec.ports}").Run()
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(strings.TrimSpace(output)).To(BeEmpty(), "%s service should have no ports", role)
-				}, 60*time.Second, time.Second).Should(Succeed())
-			}
-
-			By("verifying EndpointSlice is created with Ready pod endpoints")
-			for _, role := range []string{"prefill", "decode"} {
-				Eventually(func(g Gomega) {
-					// Check EndpointSlice exists
-					output, err := kubectl.EndpointSliceByRole(deploymentName, role).
-						Output("name").Run()
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(len(kubectl.GetNonEmptyLines(output))).To(BeNumerically(">=", 1),
-						"%s EndpointSlice should exist", role)
-
-					// Check has Ready endpoints
-					output, err = kubectl.EndpointSliceByRole(deploymentName, role).
-						JSONPath("{.items[0].endpoints[*].conditions.ready}").Run()
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(output).To(ContainSubstring("true"),
-						"%s EndpointSlice should have Ready endpoints", role)
-
-					// Check is portless
-					output, err = kubectl.EndpointSliceByRole(deploymentName, role).
-						JSONPath("{.items[0].ports}").Run()
-					g.Expect(err).NotTo(HaveOccurred())
-					trimmed := strings.TrimSpace(output)
-					g.Expect(trimmed == "" || trimmed == "null").To(BeTrue(),
-						"%s EndpointSlice should be portless, got: %q", role, trimmed)
-				}, 60*time.Second, time.Second).Should(Succeed())
-			}
 		})
 	})
 
@@ -453,16 +398,6 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("custom-annotation"))
 				g.Expect(output).To(ContainSubstring("decode-annotation"))
 			}, 60*time.Second, time.Second).Should(Succeed())
-
-			By("verifying Services have standard labels only")
-			Eventually(func(g Gomega) {
-				output, err := kubectl.ServiceByRole(deploymentName, "prefill").
-					JSONPath("{.items[0].metadata.labels}").Run()
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("disaggregatedset.x-k8s.io/name"))
-				g.Expect(output).To(ContainSubstring("disaggregatedset.x-k8s.io/role"))
-				g.Expect(output).To(ContainSubstring("disaggregatedset.x-k8s.io/revision"))
-			}, 60*time.Second, time.Second).Should(Succeed())
 		})
 
 		It("should propagate LWS CR metadata labels for Kueue integration", func() {
@@ -527,8 +462,10 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			// recreating force-deleted pods, and terminating ExclusiveTopology
 			// pods still repel other sets' pods. Wait until the pods are fully
 			// gone so later specs can schedule on a single-node cluster.
-			Eventually(func() int {
-				return kubectl.CountPods(deploymentName)
+			Eventually(func(g Gomega) int {
+				count, err := kubectl.CountPods(deploymentName)
+				g.Expect(err).NotTo(HaveOccurred())
+				return count
 			}, 90*time.Second, time.Second).Should(Equal(0))
 		})
 
@@ -569,9 +506,13 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("waiting for resources to be created")
 			Eventually(func(g Gomega) {
-				g.Expect(kubectl.CountLWS(deploymentName)).To(Equal(2))
-				g.Expect(kubectl.CountRunningPods(deploymentName)).To(Equal(2))
-				g.Expect(kubectl.CountService(deploymentName)).To(Equal(2))
+				lwsCount, err := kubectl.CountLWS(deploymentName)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(lwsCount).To(Equal(2))
+
+				runningPodCount, err := kubectl.CountRunningPods(deploymentName)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(runningPodCount).To(Equal(2))
 			}, 90*time.Second, time.Second).Should(Succeed())
 
 			By("deleting the DisaggregatedSet")
@@ -581,20 +522,14 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			By("verifying all LWS resources are garbage collected")
 			kubectl.ForLWSCount(deploymentName, 0)
 
-			By("verifying all Services are garbage collected")
-			Eventually(func(g Gomega) {
-				g.Expect(kubectl.CountService(deploymentName)).To(Equal(0))
-			}, 30*time.Second, time.Second).Should(Succeed())
-
 			By("verifying all pods are removed")
 			kubectl.ForPodCount(deploymentName, 0)
 		})
 	})
 
-	Context("Rolling Update Step Tracking", func() {
+	Context("Rolling Update Invariants", func() {
 		const deploymentName = "test-rollout-steps"
 
-		// Test cases matching plan-steps output
 		testCases := []rolloutTestCase{
 			{
 				Name:          "scale-down-role0-scale-up-role1",
@@ -604,20 +539,6 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				TargetDecode:  8,
 				PrefillSurge:  intstr.FromInt(2),
 				DecodeSurge:   intstr.FromInt(2),
-				// Expected steps from: go run ./hack/plan-steps --source '{"prefill":10,"decode":2}' --target '{"prefill":6,"decode":8}' --surge '{"prefill":2,"decode":2}'
-				ExpectedSteps: []rolloutState{
-					{OldPrefill: 10, OldDecode: 2, NewPrefill: 0, NewDecode: 0}, // step 0: initial
-					{OldPrefill: 8, OldDecode: 2, NewPrefill: 0, NewDecode: 0},  // step 1: old role0 -2
-					{OldPrefill: 6, OldDecode: 2, NewPrefill: 0, NewDecode: 0},  // step 2: old role0 -2
-					{OldPrefill: 6, OldDecode: 2, NewPrefill: 2, NewDecode: 2},  // step 3: new role0 +2, new role1 +2
-					{OldPrefill: 4, OldDecode: 1, NewPrefill: 2, NewDecode: 2},  // step 4: old role0 -2, old role1 -1
-					{OldPrefill: 4, OldDecode: 1, NewPrefill: 3, NewDecode: 4},  // step 5: new role0 +1, new role1 +2
-					{OldPrefill: 4, OldDecode: 1, NewPrefill: 4, NewDecode: 5},  // step 6: new role0 +1, new role1 +1
-					{OldPrefill: 2, OldDecode: 1, NewPrefill: 4, NewDecode: 5},  // step 7: old role0 -2
-					{OldPrefill: 2, OldDecode: 1, NewPrefill: 5, NewDecode: 7},  // step 8: new role0 +1, new role1 +2
-					{OldPrefill: 2, OldDecode: 1, NewPrefill: 6, NewDecode: 8},  // step 9: new role0 +1, new role1 +1
-					{OldPrefill: 0, OldDecode: 0, NewPrefill: 6, NewDecode: 8},  // step 10: old role0 -2, old role1 -1
-				},
 			},
 			{
 				Name:           "surge-0-unavail-2-batches-by-unavailable",
@@ -629,14 +550,36 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 				DecodeSurge:    intstr.FromInt(0),
 				PrefillUnavail: intstr.FromInt(2),
 				DecodeUnavail:  intstr.FromInt(2),
-				// Expected steps from: go run ./hack/plan-steps --source '{"prefill":4,"decode":4}' --target '{"prefill":4,"decode":4}' --surge '{"prefill":0,"decode":0}' --unavailable '{"prefill":2,"decode":2}'
-				ExpectedSteps: []rolloutState{
-					{OldPrefill: 4, OldDecode: 4, NewPrefill: 0, NewDecode: 0}, // step 0: initial
-					{OldPrefill: 2, OldDecode: 2, NewPrefill: 0, NewDecode: 0}, // step 1: drain 2 each
-					{OldPrefill: 2, OldDecode: 2, NewPrefill: 2, NewDecode: 2}, // step 2: scale up 2 each
-					{OldPrefill: 0, OldDecode: 0, NewPrefill: 2, NewDecode: 2}, // step 3: drain 2 each
-					{OldPrefill: 0, OldDecode: 0, NewPrefill: 4, NewDecode: 4}, // step 4: scale up 2 each
-				},
+			},
+			{
+				Name:           "singleton-role-drains-without-surge",
+				SourcePrefill:  1,
+				SourceDecode:   5,
+				TargetPrefill:  1,
+				TargetDecode:   5,
+				PrefillSurge:   intstr.FromInt(0),
+				DecodeSurge:    intstr.FromInt(0),
+				PrefillUnavail: intstr.FromInt(1),
+				DecodeUnavail:  intstr.FromInt(1),
+			},
+			{
+				Name:           "singleton-role-allows-100-percent-unavailable",
+				SourcePrefill:  1,
+				SourceDecode:   2,
+				TargetPrefill:  1,
+				TargetDecode:   2,
+				PrefillUnavail: intstr.FromString("100%"),
+				DecodeUnavail:  intstr.FromInt(1),
+			},
+			{
+				Name:          "singleton-role-preserves-complete-revision",
+				SourcePrefill: 1,
+				SourceDecode:  2,
+				TargetPrefill: 1,
+				TargetDecode:  2,
+				PrefillSurge:  intstr.FromInt(1),
+				DecodeSurge:   intstr.FromInt(1),
+				DecodeUnavail: intstr.FromInt(1),
 			},
 		}
 
@@ -650,98 +593,41 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 		for _, tc := range testCases {
 			tc := tc // capture range variable
-			It(fmt.Sprintf("should track rollout steps for %s", tc.Name), func() {
-				By("creating initial DisaggregatedSet with source replicas")
-				initialYaml := fixtures.PrefillDecode(deploymentName,
-					fixtures.Role{Replicas: tc.SourcePrefill, HasRollout: true, MaxSurge: tc.PrefillSurge, MaxUnavailable: tc.PrefillUnavail},
-					fixtures.Role{Replicas: tc.SourceDecode, HasRollout: true, MaxSurge: tc.DecodeSurge, MaxUnavailable: tc.DecodeUnavail},
-				).YAML()
-				Expect(applyYAML(initialYaml)).To(Succeed())
-
-				By("waiting for initial deployment to stabilize")
-				expectedInitialPods := tc.SourcePrefill + tc.SourceDecode
-				kubectl.ForRunningPodCountWithTimeout(deploymentName, expectedInitialPods, 3*time.Minute)
-
-				// Get the initial revision
-				oldRevision := kubectl.GetRevision(deploymentName)
-				Expect(oldRevision).NotTo(BeEmpty())
-				_, _ = fmt.Fprintf(GinkgoWriter, "Initial revision: %s\n", oldRevision)
-
-				// Capture initial state BEFORE triggering update
-				initialState := getCurrentRolloutState(deploymentName, oldRevision)
-				_, _ = fmt.Fprintf(GinkgoWriter, "Initial state captured: %s\n", initialState)
-
-				By("triggering rolling update by changing image and target replicas")
-				updatedYaml := fixtures.PrefillDecode(deploymentName,
-					fixtures.Role{Replicas: tc.TargetPrefill, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: tc.PrefillSurge, MaxUnavailable: tc.PrefillUnavail},
-					fixtures.Role{Replicas: tc.TargetDecode, Image: "registry.k8s.io/pause:3.10", HasRollout: true, MaxSurge: tc.DecodeSurge, MaxUnavailable: tc.DecodeUnavail},
-				).YAML()
-				Expect(applyYAML(updatedYaml)).To(Succeed())
-
-				By("tracking rollout states")
-				// Start with the initial state we captured before the update
-				observedStates := []rolloutState{initialState}
-				lastState := initialState
-
-				// Poll rapidly to capture states
-				finalState := tc.ExpectedSteps[len(tc.ExpectedSteps)-1]
-				Eventually(func(g Gomega) bool {
-					state := getCurrentRolloutState(deploymentName, oldRevision)
-
-					// Record state if it's different from the last one
-					if !state.Equals(lastState) {
-						observedStates = append(observedStates, state)
-						_, _ = fmt.Fprintf(GinkgoWriter, "Observed state %d: %s\n", len(observedStates)-1, state)
-						lastState = state
-					}
-
-					// Check if we've reached the final state
-					return state.Equals(finalState)
-				}, 5*time.Minute, 100*time.Millisecond).Should(BeTrue(), "should reach final state")
-
-				By("verifying observed states are valid")
-				_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Rollout Summary ===\n")
-				_, _ = fmt.Fprintf(GinkgoWriter, "Total observed states: %d\n", len(observedStates))
-				_, _ = fmt.Fprintf(GinkgoWriter, "Expected steps: %d\n", len(tc.ExpectedSteps))
-
-				// Build a set of valid states from expected steps
-				validStates := make(map[string]bool)
-				for _, step := range tc.ExpectedSteps {
-					validStates[step.String()] = true
-				}
-
-				// Check that all observed states are valid
-				for i, observed := range observedStates {
-					_, _ = fmt.Fprintf(GinkgoWriter, "State %d: %s", i, observed)
-					if validStates[observed.String()] {
-						_, _ = fmt.Fprintf(GinkgoWriter, " ✓\n")
-					} else {
-						_, _ = fmt.Fprintf(GinkgoWriter, " (intermediate)\n")
-					}
-				}
-
-				// Verify first and last states
-				Expect(observedStates[0]).To(Equal(tc.ExpectedSteps[0]), "initial state should match")
-				Expect(observedStates[len(observedStates)-1]).To(Equal(finalState), "final state should match")
-
-				// Verify invariants throughout rollout
-				By("verifying surge limits were respected")
-				maxPrefillSurge := tc.PrefillSurge.IntValue()
-				maxDecodeSurge := tc.DecodeSurge.IntValue()
-				for _, state := range observedStates {
-					totalPrefill := state.OldPrefill + state.NewPrefill
-					totalDecode := state.OldDecode + state.NewDecode
-
-					maxAllowedPrefill := max(tc.SourcePrefill, tc.TargetPrefill) + maxPrefillSurge
-					maxAllowedDecode := max(tc.SourceDecode, tc.TargetDecode) + maxDecodeSurge
-
-					Expect(totalPrefill).To(BeNumerically("<=", maxAllowedPrefill),
-						"prefill surge limit exceeded at state %s", state)
-					Expect(totalDecode).To(BeNumerically("<=", maxAllowedDecode),
-						"decode surge limit exceeded at state %s", state)
-				}
+			It(fmt.Sprintf("should preserve rollout invariants for %s", tc.Name), func() {
+				runObservedRollout(deploymentName, tc)
 			})
 		}
+	})
+
+	Context("Slow Rollout with Imbalanced Roles", func() {
+		const deploymentName = "test-slow-rollout"
+		const (
+			prefill        = 8
+			decode         = 4
+			maxSurge       = 2
+			maxUnavailable = 2
+			startupDelay   = 30
+		)
+
+		AfterEach(func() {
+			kubectl.CleanupDeployment(deploymentName)
+		})
+
+		It("should pipeline work while earlier replicas are unready", func() {
+			observations := runObservedRollout(deploymentName, rolloutTestCase{
+				SourcePrefill: prefill, SourceDecode: decode,
+				TargetPrefill: prefill, TargetDecode: decode,
+				PrefillSurge: intstr.FromInt(maxSurge), DecodeSurge: intstr.FromInt(maxSurge),
+				PrefillUnavail: intstr.FromInt(maxUnavailable), DecodeUnavail: intstr.FromInt(maxUnavailable),
+				StartupDelaySeconds: startupDelay,
+			})
+			pipelined := false
+			for _, observation := range observations {
+				pipelined = pipelined || observation.Spec.NewPrefill >= 4 && observation.Spec.NewDecode >= 2 &&
+					observation.NewReadyPrefill < 2 && observation.NewReadyDecode < 1
+			}
+			Expect(pipelined).To(BeTrue(), "a second fraction should be issued while the first is unready")
+		})
 	})
 
 	Context("N-Role Rolling Update (3 roles)", func() {
@@ -769,7 +655,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			By("verifying 3 LWS resources exist (one per role)")
 			kubectl.ForLWSCount(deploymentName, 3)
 
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("triggering rolling update by changing image")
@@ -814,7 +701,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 6, 3*time.Minute)
 
 			// Get the initial revision
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("applying update that renames 'encode' to 'decode-long-context'")
@@ -837,7 +725,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			Eventually(func(g Gomega) {
 				// Verify encode role from old revision is scaled to 0
-				g.Expect(kubectl.GetTotalReplicas(deploymentName, oldRevision)).To(Equal(0))
+				replicas, err := kubectl.GetTotalReplicas(deploymentName, oldRevision)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(replicas).To(Equal(0))
 			}, 60*time.Second, time.Second).Should(Succeed())
 
 			By("verifying total running pods is correct")
@@ -867,7 +757,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 5, 3*time.Minute)
 
 			By("recording initial revision")
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("adding new role 'gamma'")
@@ -915,7 +806,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 10, 3*time.Minute)
 
 			By("recording initial revision")
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("adding new role 'encode' - this should trigger progressive rollout")
@@ -930,7 +822,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			Expect(applyYAML(updatedYaml)).To(Succeed())
 
 			By("tracking rollout to verify progressive scaling (not brutal drain)")
-			result := kubectl.TrackProgressiveRollout(deploymentName, oldRevision, 10, 12)
+			result, err := kubectl.TrackProgressiveRollout(deploymentName, oldRevision, 10, 12)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("verifying progressive rollout occurred (not brutal drain)")
 			Expect(result.SawIntermediateOld || result.SawIntermediateNew).To(BeTrue(),
@@ -970,7 +863,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 12, 3*time.Minute)
 
 			By("recording initial revision")
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("removing 'encode' role - this should trigger progressive rollout")
@@ -984,7 +878,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			Expect(applyYAML(updatedYaml)).To(Succeed())
 
 			By("tracking rollout to verify progressive scaling")
-			result := kubectl.TrackProgressiveRollout(deploymentName, oldRevision, 12, 10)
+			result, err := kubectl.TrackProgressiveRollout(deploymentName, oldRevision, 12, 10)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("verifying progressive rollout occurred")
 			Expect(result.SawIntermediateOld || result.SawIntermediateNew).To(BeTrue(),
@@ -995,7 +890,9 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 
 			By("verifying encode role no longer exists or has 0 replicas")
 			Eventually(func(g Gomega) {
-				g.Expect(kubectl.GetTotalReplicas(deploymentName, oldRevision)).To(Equal(0))
+				replicas, err := kubectl.GetTotalReplicas(deploymentName, oldRevision)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(replicas).To(Equal(0))
 			}, 30*time.Second, time.Second).Should(Succeed())
 
 			By("verifying total running pods (no encode role)")
@@ -1003,14 +900,14 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 		})
 	})
 
-	Context("Mid-rollout A→B→C (newest-first drain)", func() {
+	Context("Mid-rollout A→B→C", func() {
 		const deploymentName = "test-abc-drain"
 
 		AfterEach(func() {
 			kubectl.CleanupDeployment(deploymentName)
 		})
 
-		It("should drain B (broken intermediate) before A (stable original)", func() {
+		It("should complete after the target changes mid-rollout", func() {
 			By("creating initial deployment A (6 replicas per role)")
 			yamlA := fixtures.PrefillDecode(deploymentName,
 				fixtures.Role{Replicas: 6, HasRollout: true, MaxSurge: intstr.FromInt(1)},
@@ -1018,7 +915,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			).YAML()
 			Expect(applyYAML(yamlA)).To(Succeed())
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 12, 3*time.Minute)
-			revisionA := kubectl.GetRevision(deploymentName)
+			revisionA, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(revisionA).NotTo(BeEmpty())
 			_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Revision A (stable original): %s ===\n", revisionA)
 
@@ -1030,8 +928,10 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			Expect(applyYAML(yamlB)).To(Succeed())
 
 			By("waiting for B rollout to start (new LWS created)")
-			Eventually(func() int {
-				return kubectl.CountLWS(deploymentName)
+			Eventually(func(g Gomega) int {
+				count, err := kubectl.CountLWS(deploymentName)
+				g.Expect(err).NotTo(HaveOccurred())
+				return count
 			}, 30*time.Second, time.Second).Should(BeNumerically(">", 2))
 
 			// Find revision B
@@ -1088,30 +988,15 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			}, 30*time.Second, time.Second).Should(Succeed())
 			_, _ = fmt.Fprintf(GinkgoWriter, "=== Revision C (the fix / target): %s ===\n\n", revisionC)
 
-			By("tracking drain order: B must drain to 0 before A")
-			bDrainedFirst := false
-			aDrainedBeforeB := false
-
+			By("waiting for both A and B to fully drain")
 			Eventually(func(g Gomega) bool {
-				aTotal := kubectl.GetTotalReplicas(deploymentName, revisionA)
-				bTotal := kubectl.GetTotalReplicas(deploymentName, revisionB)
-				cTotal := kubectl.GetTotalReplicas(deploymentName, revisionC)
-
-				_, _ = fmt.Fprintf(GinkgoWriter, "A(%s)=%d  B(%s)=%d  C(%s)=%d\n",
-					revisionA[:8], aTotal, revisionB[:8], bTotal, revisionC[:8], cTotal)
-
-				if bTotal == 0 && aTotal > 0 {
-					bDrainedFirst = true
-				}
-				if aTotal == 0 && bTotal > 0 {
-					aDrainedBeforeB = true
-				}
+				aTotal, err := kubectl.GetTotalReplicas(deploymentName, revisionA)
+				g.Expect(err).NotTo(HaveOccurred())
+				bTotal, err := kubectl.GetTotalReplicas(deploymentName, revisionB)
+				g.Expect(err).NotTo(HaveOccurred())
 
 				return aTotal == 0 && bTotal == 0
 			}, 5*time.Minute, 500*time.Millisecond).Should(BeTrue(), "both A and B should fully drain")
-
-			Expect(bDrainedFirst).To(BeTrue(), "B (newer intermediate) should drain to 0 before A (stable original)")
-			Expect(aDrainedBeforeB).To(BeFalse(), "A should NOT drain to 0 while B still has replicas")
 
 			By("verifying final state: only C at target replicas")
 			kubectl.ForSingleActiveRevision(deploymentName, revisionA)
@@ -1142,7 +1027,8 @@ var _ = Describe("DisaggregatedSet E2E Tests", Ordered, func() {
 			kubectl.ForRunningPodCountWithTimeout(deploymentName, 10, 3*time.Minute)
 
 			By("recording initial revision")
-			oldRevision := kubectl.GetRevision(deploymentName)
+			oldRevision, err := kubectl.GetRevision(deploymentName)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(oldRevision).NotTo(BeEmpty())
 
 			By("renaming 'zeta' to 'gamma' (remove zeta, add gamma)")
@@ -1179,6 +1065,14 @@ type rolloutState struct {
 	NewDecode  int
 }
 
+type rolloutObservation struct {
+	Spec            rolloutState
+	OldReadyPrefill int
+	OldReadyDecode  int
+	NewReadyPrefill int
+	NewReadyDecode  int
+}
+
 func (s rolloutState) String() string {
 	return fmt.Sprintf("old(p=%d,d=%d) new(p=%d,d=%d)", s.OldPrefill, s.OldDecode, s.NewPrefill, s.NewDecode)
 }
@@ -1192,52 +1086,195 @@ func (s rolloutState) Equals(other rolloutState) bool {
 
 // rolloutTestCase defines a rolling update scenario to test
 type rolloutTestCase struct {
-	Name           string
-	SourcePrefill  int
-	SourceDecode   int
-	TargetPrefill  int
-	TargetDecode   int
-	PrefillSurge   intstr.IntOrString
-	DecodeSurge    intstr.IntOrString
-	PrefillUnavail intstr.IntOrString
-	DecodeUnavail  intstr.IntOrString
-	ExpectedSteps  []rolloutState
+	Name                          string
+	SourcePrefill, SourceDecode   int
+	TargetPrefill, TargetDecode   int
+	PrefillSurge, DecodeSurge     intstr.IntOrString
+	PrefillUnavail, DecodeUnavail intstr.IntOrString
+	StartupDelaySeconds           int
 }
 
-// getCurrentRolloutState queries the cluster for current LWS replica counts
-func getCurrentRolloutState(deploymentName, oldRevision string) rolloutState {
+func runObservedRollout(deploymentName string, tc rolloutTestCase) []rolloutObservation {
+	GinkgoHelper()
+	role := func(replicas int, surge, unavailable intstr.IntOrString, updated bool) fixtures.Role {
+		result := fixtures.Role{
+			Replicas: replicas, HasRollout: true, MaxSurge: surge, MaxUnavailable: unavailable,
+			StartupDelaySeconds: tc.StartupDelaySeconds,
+		}
+		if updated && tc.StartupDelaySeconds > 0 {
+			result.Annotations = map[string]string{"rollout-version": "v2"}
+		} else if updated {
+			result.Image = "registry.k8s.io/pause:3.10"
+		}
+		return result
+	}
+	config := func(prefill, decode int, updated bool) string {
+		return fixtures.PrefillDecode(deploymentName,
+			role(prefill, tc.PrefillSurge, tc.PrefillUnavail, updated),
+			role(decode, tc.DecodeSurge, tc.DecodeUnavail, updated),
+		).YAML()
+	}
+
+	By("creating initial DisaggregatedSet with source replicas")
+	Expect(applyYAML(config(tc.SourcePrefill, tc.SourceDecode, false))).To(Succeed())
+	kubectl.ForRunningPodCountWithTimeout(deploymentName, tc.SourcePrefill+tc.SourceDecode, 3*time.Minute)
+	oldRevision, err := kubectl.GetRevision(deploymentName)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(oldRevision).NotTo(BeEmpty())
+
+	var initial rolloutObservation
+	Eventually(func(g Gomega) {
+		initial, err = getCurrentRolloutObservation(deploymentName, oldRevision)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(initial.OldReadyPrefill).To(Equal(tc.SourcePrefill))
+		g.Expect(initial.OldReadyDecode).To(Equal(tc.SourceDecode))
+	}, 3*time.Minute, time.Second).Should(Succeed())
+
+	By("triggering the rolling update")
+	Expect(applyYAML(config(tc.TargetPrefill, tc.TargetDecode, true))).To(Succeed())
+	observations := []rolloutObservation{initial}
+	lastState := initial.Spec
+	finalState := rolloutState{NewPrefill: tc.TargetPrefill, NewDecode: tc.TargetDecode}
+	Eventually(func(g Gomega) bool {
+		observation, err := getCurrentRolloutObservation(deploymentName, oldRevision)
+		g.Expect(err).NotTo(HaveOccurred())
+		if !observation.Spec.Equals(lastState) {
+			observations = append(observations, observation)
+			lastState = observation.Spec
+		}
+		return observation.Spec.Equals(finalState) && observation.NewReadyPrefill == tc.TargetPrefill &&
+			observation.NewReadyDecode == tc.TargetDecode
+	}, 8*time.Minute, 100*time.Millisecond).Should(BeTrue(), "should reach the final Spec and Ready state")
+
+	assertRolloutObservations(tc, observations)
+	Expect(observations[0].Spec).To(Equal(rolloutState{OldPrefill: tc.SourcePrefill, OldDecode: tc.SourceDecode}))
+	Expect(observations[len(observations)-1].Spec).To(Equal(finalState))
+	return observations
+}
+
+func assertRolloutObservations(tc rolloutTestCase, observations []rolloutObservation) {
+	GinkgoHelper()
+	Expect(observations).NotTo(BeEmpty())
+
+	prefillSurge := rolloutSurge(tc.PrefillSurge, tc.PrefillUnavail, tc.TargetPrefill)
+	decodeSurge := rolloutSurge(tc.DecodeSurge, tc.DecodeUnavail, tc.TargetDecode)
+	prefillCeiling := max(tc.SourcePrefill, tc.TargetPrefill) + prefillSurge
+	decodeCeiling := max(tc.SourceDecode, tc.TargetDecode) + decodeSurge
+	prefillUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&tc.PrefillUnavail, tc.TargetPrefill, false)
+	Expect(err).NotTo(HaveOccurred())
+	decodeUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&tc.DecodeUnavail, tc.TargetDecode, false)
+	Expect(err).NotTo(HaveOccurred())
+	allowOutage := (tc.SourcePrefill > 0 && tc.TargetPrefill > 0 && prefillUnavailable >= tc.TargetPrefill) ||
+		(tc.SourceDecode > 0 && tc.TargetDecode > 0 && decodeUnavailable >= tc.TargetDecode)
+	prefillFloor := max(0, min(tc.SourcePrefill, tc.TargetPrefill)-prefillUnavailable)
+	decodeFloor := max(0, min(tc.SourceDecode, tc.TargetDecode)-decodeUnavailable)
+
+	for i, observation := range observations {
+		state := observation.Spec
+		_, _ = fmt.Fprintf(GinkgoWriter, "State %d: %s\n", i, state)
+
+		Expect(state.OldPrefill+state.NewPrefill).To(BeNumerically("<=", prefillCeiling),
+			"prefill surge ceiling exceeded at state %s", state)
+		Expect(state.OldDecode+state.NewDecode).To(BeNumerically("<=", decodeCeiling),
+			"decode surge ceiling exceeded at state %s", state)
+		Expect(state.OldPrefill+state.NewPrefill).To(BeNumerically(">=", prefillFloor),
+			"too few prefill groups to satisfy its availability floor at state %s", state)
+		Expect(state.OldDecode+state.NewDecode).To(BeNumerically(">=", decodeFloor),
+			"too few decode groups to satisfy its availability floor at state %s", state)
+
+		if i > 0 {
+			previous := observations[i-1].Spec
+			Expect(state.OldPrefill).To(BeNumerically("<=", previous.OldPrefill),
+				"old prefill replicas increased between %s and %s", previous, state)
+			Expect(state.OldDecode).To(BeNumerically("<=", previous.OldDecode),
+				"old decode replicas increased between %s and %s", previous, state)
+			Expect(state.NewPrefill).To(BeNumerically(">=", previous.NewPrefill),
+				"new prefill replicas decreased between %s and %s", previous, state)
+			Expect(state.NewDecode).To(BeNumerically(">=", previous.NewDecode),
+				"new decode replicas decreased between %s and %s", previous, state)
+		}
+
+		// Unless a live required role permits an outage, the old revision must
+		// retire together. Retiring the two LWS objects is not atomic, so one observation
+		// may contain only half of the final retirement. The next distinct Spec
+		// state must finish it; the controller must not keep rolling one role
+		// while the other role is already gone.
+		if !allowOutage && (state.OldPrefill == 0) != (state.OldDecode == 0) {
+			Expect(i+1).To(BeNumerically("<", len(observations)),
+				"old revision remained incomplete at state %s", state)
+			if i+1 < len(observations) {
+				next := observations[i+1].Spec
+				Expect(next.OldPrefill).To(BeZero(),
+					"old revision kept prefill after incomplete state %s", state)
+				Expect(next.OldDecode).To(BeZero(),
+					"old revision kept decode after incomplete state %s", state)
+			}
+		}
+	}
+}
+
+func rolloutSurge(surgeValue, unavailableValue intstr.IntOrString, replicas int) int {
+	GinkgoHelper()
+	surge, err := intstr.GetScaledValueFromIntOrPercent(&surgeValue, replicas, true)
+	Expect(err).NotTo(HaveOccurred())
+	unavailable, err := intstr.GetScaledValueFromIntOrPercent(&unavailableValue, replicas, false)
+	Expect(err).NotTo(HaveOccurred())
+	if surge > 0 || unavailable > 0 {
+		return surge
+	}
+	return 1
+}
+
+// getCurrentRolloutObservation returns both the issued Spec footprint and the
+// Ready capacity committed to that footprint. Status can lag after a scale-down,
+// so replicas above Spec are reserved from Ready before Ready is capped at Spec.
+func getCurrentRolloutObservation(deploymentName, oldRevision string) (rolloutObservation, error) {
 	output, err := kubectl.LWS(deploymentName).
-		JSONPath(`{range .items[*]}{.metadata.labels.disaggregatedset\.x-k8s\.io/revision},{.metadata.labels.disaggregatedset\.x-k8s\.io/role},{.spec.replicas}{"\n"}{end}`).
+		JSONPath(`{range .items[*]}{.metadata.labels.disaggregatedset\.x-k8s\.io/revision},{.metadata.labels.disaggregatedset\.x-k8s\.io/role},{.spec.replicas},{.status.replicas},{.status.readyReplicas}{"\n"}{end}`).
 		RunQuiet()
 	if err != nil {
-		return rolloutState{}
+		return rolloutObservation{}, err
 	}
 
-	state := rolloutState{}
+	observation := rolloutObservation{}
 	for _, line := range kubectl.GetNonEmptyLines(output) {
 		parts := strings.Split(line, ",")
-		if len(parts) != 3 {
-			continue
+		if len(parts) != 5 {
+			return rolloutObservation{}, fmt.Errorf("unexpected rollout observation %q", line)
 		}
-		revision := parts[0]
-		role := parts[1]
-		replicas, _ := strconv.Atoi(parts[2])
-
-		isOld := revision == oldRevision
-		if role == "prefill" {
-			if isOld {
-				state.OldPrefill = replicas
-			} else {
-				state.NewPrefill = replicas
+		var counts [3]int
+		for i, value := range parts[2:] {
+			if i > 0 && (value == "" || value == "<no value>") {
+				continue
 			}
-		} else if role == "decode" {
+			counts[i], err = strconv.Atoi(value)
+			if err != nil {
+				return rolloutObservation{}, fmt.Errorf("parse replica count in rollout observation %q: %w", line, err)
+			}
+		}
+		spec, statusReplicas, ready := counts[0], counts[1], counts[2]
+		pendingDrain := max(0, statusReplicas-spec)
+		ready = min(spec, max(0, ready-pendingDrain))
+
+		isOld := parts[0] == oldRevision
+		switch parts[1] {
+		case "prefill":
 			if isOld {
-				state.OldDecode = replicas
+				observation.Spec.OldPrefill += spec
+				observation.OldReadyPrefill += ready
 			} else {
-				state.NewDecode = replicas
+				observation.Spec.NewPrefill += spec
+				observation.NewReadyPrefill += ready
+			}
+		case "decode":
+			if isOld {
+				observation.Spec.OldDecode += spec
+				observation.OldReadyDecode += ready
+			} else {
+				observation.Spec.NewDecode += spec
+				observation.NewReadyDecode += ready
 			}
 		}
 	}
-
-	return state
+	return observation, nil
 }

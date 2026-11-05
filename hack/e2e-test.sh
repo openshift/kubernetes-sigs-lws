@@ -19,12 +19,42 @@ set -o nounset
 set -o pipefail
 
 SCHEDULER_PROVIDER=${SCHEDULER_PROVIDER:-""}
+USE_FAKE_GPU_OPERATOR=${USE_FAKE_GPU_OPERATOR:-"false"}
+FAKE_GPU_OPERATOR_VERSION=${FAKE_GPU_OPERATOR_VERSION:-"0.0.72"}
 LWS_UPGRADE_FROM_VERSION=${LWS_UPGRADE_FROM_VERSION:-""}
+# LWS_UPGRADE_METHOD selects how the old release is installed and upgraded:
+# "manifests" (default, kustomize) or "helm".
+LWS_UPGRADE_METHOD=${LWS_UPGRADE_METHOD:-"manifests"}
+# LWS_UPGRADE_LEGACY_CRD=true runs the documented one-time migration for releases
+# up to v0.7.0, whose chart rendered the LeaderWorkerSet CRD from templates/crds/.
+# Without it the first helm upgrade across the v0.8.0 boundary deletes the CRD
+# (#880). It skips the pre-upgrade DisaggregatedSet checks, since that CRD only
+# exists from v0.9.0.
+LWS_UPGRADE_LEGACY_CRD=${LWS_UPGRADE_LEGACY_CRD:-"false"}
+HELM=${HELM:-"./bin/helm"}
+HELM_CHART_REPO=${HELM_CHART_REPO:-"registry.k8s.io/lws/charts"}
+HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-"lws"}
 LWS_NAMESPACE=${LWS_NAMESPACE:-"lws-system"}
 export CWD=$(pwd)
 
 KUBECONFIG_PATH=""
 OLD_MANIFEST=""
+CLUSTER_CREATED=false
+
+if [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
+    if [ -n "$LWS_UPGRADE_FROM_VERSION" ] || [ -n "$SCHEDULER_PROVIDER" ] || [ "${USE_CERT_MANAGER:-false}" == "true" ]; then
+        echo "Fake GPU tests cannot be combined with upgrade, scheduler, or certificate overrides." >&2
+        exit 1
+    fi
+    if [ "$USE_EXISTING_CLUSTER" == "true" ] && [ -z "${KUBECONFIG:-}" ]; then
+        echo "Fake GPU tests require an explicit, dedicated KUBECONFIG for an existing cluster." >&2
+        exit 1
+    fi
+    if [ "${KUBECONFIG:-}" == "$HOME/.kube/config" ] || [[ "${KUBECONFIG:-}" == *:* ]]; then
+        echo "Fake GPU tests require a single dedicated kubeconfig file." >&2
+        exit 1
+    fi
+fi
 
 if [ -n "$LWS_UPGRADE_FROM_VERSION" ]; then
     OLD_CONTROLLER_IMAGE="registry.k8s.io/lws/lws:${LWS_UPGRADE_FROM_VERSION}"
@@ -41,7 +71,7 @@ function save_controller_logs {
 }
 
 function cleanup {
-    if [ $USE_EXISTING_CLUSTER == 'false' ]
+    if [ "$CLUSTER_CREATED" == "true" ]
     then
         if [ ! -d "$ARTIFACTS" ]; then
             mkdir -p "$ARTIFACTS"
@@ -54,10 +84,18 @@ function cleanup {
             $KUBECTL logs -n volcano-system deployment/volcano-controllers > "$ARTIFACTS"/volcano-controller-manager.log || true
             $KUBECTL describe pods -n volcano-system > "$ARTIFACTS"/volcano-system-pods.log || true
         fi
+        if [ "$SCHEDULER_PROVIDER" == "kubernetes" ]; then
+            $KUBECTL get workloads.scheduling.k8s.io,podgroups.scheduling.k8s.io,pods -A -o yaml > "$ARTIFACTS"/was-objects.yaml || true
+            $KUBECTL get events -A --sort-by=.lastTimestamp > "$ARTIFACTS"/events.log || true
+        fi
 
         if [ -n "$LWS_UPGRADE_FROM_VERSION" ]; then
             $KUBECTL get events -A --sort-by=.lastTimestamp > "$ARTIFACTS"/events.log 2>&1 || true
-            $KUBECTL get leaderworkersets,disaggregatedsets,pods,statefulsets,services \
+            local workload_types="leaderworkersets,pods,statefulsets,services"
+            if $KUBECTL get crd disaggregatedsets.disaggregatedset.x-k8s.io > /dev/null 2>&1; then
+                workload_types="leaderworkersets,disaggregatedsets,pods,statefulsets,services"
+            fi
+            $KUBECTL get $workload_types \
                 -n "$TEST_NAMESPACE" -o yaml > "$ARTIFACTS"/upgrade-workloads.yaml 2>&1 || true
         fi
 
@@ -90,14 +128,37 @@ function startup {
             mkdir -p "$ARTIFACTS"
         fi
 
-        if [ -n "$LWS_UPGRADE_FROM_VERSION" ]; then
+        if [ -n "$LWS_UPGRADE_FROM_VERSION" ] || {
+            [ -z "${KUBECONFIG:-}" ] && { [ "$SCHEDULER_PROVIDER" == "kubernetes" ] || [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; }
+        }; then
             KUBECONFIG_PATH="$(mktemp)"
             export KUBECONFIG="$KUBECONFIG_PATH"
         fi
 
-        $KIND create cluster --name $KIND_CLUSTER_NAME --image $E2E_KIND_VERSION --wait 1m
+        local kind_args=()
+        if [ "$SCHEDULER_PROVIDER" == "kubernetes" ]; then
+            kind_args+=(--config "${KIND_CONFIG:-$CWD/test/e2e/config/kind-was.yaml}")
+        elif [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
+            kind_args+=(--config "${KIND_CONFIG:-$CWD/test/e2e/config/fake-gpu/kind.yaml}")
+        fi
+        $KIND create cluster --name $KIND_CLUSTER_NAME --image $E2E_KIND_VERSION --wait 1m "${kind_args[@]}"
+        CLUSTER_CREATED=true
         $KUBECTL get nodes > $ARTIFACTS/kind-nodes.log || true
         $KUBECTL describe pods -n kube-system > $ARTIFACTS/kube-system-pods.log || true
+    fi
+}
+function deploy_fake_gpu_operator() {
+    if [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
+        if [ "$USE_EXISTING_CLUSTER" == "true" ]; then
+            # Existing clusters are caller-owned; never install or upgrade their backend.
+            $HELM status fake-gpu -n fake-gpu > /dev/null
+        else
+            $HELM install fake-gpu oci://ghcr.io/run-ai/fake-gpu-operator/fake-gpu-operator \
+                --version "$FAKE_GPU_OPERATOR_VERSION" \
+                --namespace fake-gpu --create-namespace \
+                -f "$CWD/test/e2e/config/fake-gpu/values.yaml" \
+                --wait --timeout 5m
+        fi
     fi
 }
 function deploy_cert_manager() {
@@ -119,18 +180,18 @@ function deploy_gang_scheduler() {
 
 # Avoid kind's --all-platforms import path for multi-arch release images.
 function kind_load_image {
-    local image="$1"
-    local archive
-    archive="$(mktemp)"
-    trap 'rm -f "$archive"' RETURN
-    docker save "$image" -o "$archive"
+    (
+        local image="$1"
+        local archive
+        archive="$(mktemp)"
+        trap 'rm -f "$archive"' EXIT
+        docker save "$image" -o "$archive"
 
-    while IFS= read -r node; do
-        docker exec -i "$node" ctr --namespace=k8s.io images import \
-            --digests --snapshotter=overlayfs - < "$archive"
-    done < <($KIND get nodes --name "$KIND_CLUSTER_NAME")
-
-    rm -f "$archive"
+        while IFS= read -r node; do
+            docker exec -i "$node" ctr --namespace=k8s.io images import \
+                --digests --snapshotter=overlayfs - < "$archive"
+        done < <($KIND get nodes --name "$KIND_CLUSTER_NAME")
+    )
 }
 
 function kind_load {
@@ -159,9 +220,49 @@ function install_old_release {
         -n "$LWS_NAMESPACE" --timeout=5m
 }
 
+function install_old_release_helm {
+    # Install the previous released chart from the OCI registry. The old chart
+    # pins its controller image to the release tag with pullPolicy IfNotPresent,
+    # and that image is already loaded into kind by kind_load, so nothing is
+    # pulled from inside the cluster.
+    $HELM install "$HELM_RELEASE_NAME" "oci://${HELM_CHART_REPO}/lws" \
+        --version "$LWS_UPGRADE_FROM_VERSION" \
+        --namespace "$LWS_NAMESPACE" --create-namespace \
+        --set enableDisaggregatedSet=true \
+        --wait --timeout 5m
+    $KUBECTL rollout status deployment/lws-controller-manager \
+        -n "$LWS_NAMESPACE" --timeout=5m
+}
+
+function upgrade_to_current_helm {
+    # Follow the documented Helm upgrade procedure: reconcile CRDs explicitly
+    # (helm upgrade never touches crds/), then upgrade the release in place with
+    # the locally built, kind-loaded controller image.
+    if [ "$LWS_UPGRADE_LEGACY_CRD" == "true" ]; then
+        # charts/lws/README.md, "Upgrading from v0.7.0 or earlier": keep the CRD
+        # when it leaves the Helm release manifest.
+        $KUBECTL annotate crd leaderworkersets.leaderworkerset.x-k8s.io \
+            helm.sh/resource-policy=keep --overwrite
+    fi
+    $KUBECTL apply --server-side --force-conflicts -f "$CWD/charts/lws/crds"
+
+    local image_repo="${IMAGE_TAG%:*}"
+    local image_tag="${IMAGE_TAG##*:}"
+
+    $HELM upgrade "$HELM_RELEASE_NAME" "$CWD/charts/lws" \
+        --namespace "$LWS_NAMESPACE" \
+        --set image.manager.repository="$image_repo" \
+        --set image.manager.tag="$image_tag" \
+        --set image.manager.pullPolicy=IfNotPresent \
+        --wait --timeout 5m
+    $KUBECTL rollout status deployment/lws-controller-manager \
+        -n "$LWS_NAMESPACE" --timeout=5m
+}
+
 function run_upgrade_phase {
     local phase="$1"
     LWS_UPGRADE_PHASE="$phase" \
+    LWS_UPGRADE_LEGACY_CRD="$LWS_UPGRADE_LEGACY_CRD" \
     LWS_UPGRADE_SNAPSHOT_PATH="$SNAPSHOT_PATH" \
     IMAGE_TAG="$IMAGE_TAG" \
     LWS_NAMESPACE="$LWS_NAMESPACE" \
@@ -194,11 +295,18 @@ function upgrade_to_current {
 }
 
 function upgrade_test_flow {
-    echo "Upgrade test: $LWS_UPGRADE_FROM_VERSION -> current"
-    install_old_release
-    run_upgrade_phase before
-    save_controller_logs "$ARTIFACTS/old-controller.log"
-    upgrade_to_current
+    echo "Upgrade test ($LWS_UPGRADE_METHOD): $LWS_UPGRADE_FROM_VERSION -> current"
+    if [ "$LWS_UPGRADE_METHOD" == "helm" ]; then
+        install_old_release_helm
+        run_upgrade_phase before
+        save_controller_logs "$ARTIFACTS/old-controller.log"
+        upgrade_to_current_helm
+    else
+        install_old_release
+        run_upgrade_phase before
+        save_controller_logs "$ARTIFACTS/old-controller.log"
+        upgrade_to_current
+    fi
 }
 
 function lws_deploy {
@@ -210,7 +318,7 @@ function lws_deploy {
     pushd "$CWD/config/manager"
     $KUSTOMIZE edit set image controller=$IMAGE_TAG
     # Base configuration
-    config_content="apiVersion: config.lws.x-k8s.io/v1alpha1
+    config_content="apiVersion: config.lws.x-k8s.io/v1
 kind: Configuration
 leaderElection:
   leaderElect: true"
@@ -225,6 +333,11 @@ internalCertManagement:
         config_content="$config_content
 gangSchedulingManagement:
   schedulerProvider: $SCHEDULER_PROVIDER"
+    fi
+    if [ "$SCHEDULER_PROVIDER" == "kubernetes" ]; then
+        config_content="$config_content
+featureGates:
+  WorkloadAwareScheduling: true"
     fi
     echo "$config_content" > controller_manager_config.yaml
     popd
@@ -255,9 +368,13 @@ EOF
         $KUSTOMIZE edit remove resource "../internalcert"
         $KUSTOMIZE build $CWD/test/e2e/config/certmanager | $KUBECTL apply --server-side -f -
       popd
+    elif [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
+      $KUSTOMIZE build "$CWD/test/e2e/config/fake-gpu" | $KUBECTL apply --server-side -f -
     else
       $KUSTOMIZE build $CWD/test/e2e/config | $KUBECTL apply --server-side -f -
     fi
+    $KUBECTL rollout status deployment/lws-controller-manager \
+        -n "$LWS_NAMESPACE" --timeout=5m
 }
 
 function run_tests() {
@@ -266,12 +383,17 @@ function run_tests() {
         return
     fi
 
-    if [ -n "$SCHEDULER_PROVIDER" ]; then
+    if [ "$USE_FAKE_GPU_OPERATOR" == "true" ]; then
+        $GINKGO --junit-report=junit.xml --json-report=fake-gpu.json \
+            --output-dir="$ARTIFACTS" -v --fail-on-empty --label-filter=FakeGPU "$CWD/test/e2e"
+    elif [ "$SCHEDULER_PROVIDER" == "kubernetes" ]; then
+        $GINKGO --junit-report=junit.xml --output-dir="$ARTIFACTS" -v --fail-on-empty --label-filter=WorkloadAwareScheduling "$CWD/test/e2e"
+    elif [ -n "$SCHEDULER_PROVIDER" ]; then
         # Run gang scheduling tests
-        $GINKGO --junit-report=junit.xml --output-dir=$ARTIFACTS -v --skip-package=upgrade --focus="leaderWorkerSet e2e gang scheduling tests" $CWD/test/e2e/...
+        $GINKGO --junit-report=junit.xml --output-dir=$ARTIFACTS -v --skip-package=upgrade --label-filter='!WorkloadAwareScheduling' --focus="leaderWorkerSet e2e gang scheduling tests" $CWD/test/e2e/...
     else
         # Run normal tests, skip gang scheduling tests
-        $GINKGO --junit-report=junit.xml --output-dir=$ARTIFACTS -v --skip-package=upgrade --skip="leaderWorkerSet e2e gang scheduling tests" $CWD/test/e2e/...
+        $GINKGO --junit-report=junit.xml --output-dir=$ARTIFACTS -v --skip-package=upgrade --label-filter='!FakeGPU' --skip="leaderWorkerSet e2e gang scheduling tests" $CWD/test/e2e/...
     fi
 }
 
@@ -279,6 +401,7 @@ trap cleanup EXIT
 startup
 pull_upgrade_images
 kind_load
+deploy_fake_gpu_operator
 deploy_cert_manager
 deploy_gang_scheduler
 lws_deploy

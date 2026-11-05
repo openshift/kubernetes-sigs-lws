@@ -17,11 +17,20 @@ limitations under the License.
 package webhooks
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/utils/ptr"
+
+	v1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/schedulerprovider"
+	"sigs.k8s.io/lws/test/wrappers"
 )
 
 func TestGetPercentValue(t *testing.T) {
@@ -183,4 +192,521 @@ func TestIsNotMoreThan100Percent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateUnknownTargetRollingUpdateBudget(t *testing.T) {
+	zeroPair := "must not be 0 when `maxSurge` is 0"
+	tests := []struct {
+		name               string
+		surge, unavailable intstr.IntOrString
+		wantField          string
+		wantDetail         string
+	}{
+		{name: "percentage that rounds to zero at a small count", surge: intstr.FromInt32(0), unavailable: intstr.FromString("25%")},
+		{name: "smallest percentage", surge: intstr.FromInt32(0), unavailable: intstr.FromString("1%")},
+		{name: "integer", surge: intstr.FromInt32(0), unavailable: intstr.FromInt32(3)},
+		{name: "surge only", surge: intstr.FromInt32(1), unavailable: intstr.FromInt32(0)},
+		{name: "zero integers", surge: intstr.FromInt32(0), unavailable: intstr.FromInt32(0), wantField: "maxUnavailable", wantDetail: zeroPair},
+		{name: "zero percentages", surge: intstr.FromString("0%"), unavailable: intstr.FromString("0%"), wantField: "maxUnavailable", wantDetail: zeroPair},
+		{name: "zero percentage with leading zeros", surge: intstr.FromInt32(0), unavailable: intstr.FromString("00%"), wantField: "maxUnavailable", wantDetail: zeroPair},
+		{name: "negative surge", surge: intstr.FromInt32(-1), unavailable: intstr.FromInt32(1), wantField: "maxSurge", wantDetail: "must be greater than or equal to 0"},
+		{name: "unavailable above 100%", surge: intstr.FromInt32(0), unavailable: intstr.FromString("101%"), wantField: "maxUnavailable", wantDetail: "must not be greater than 100%"},
+		{name: "malformed unavailable", surge: intstr.FromInt32(0), unavailable: intstr.FromString("bad"), wantField: "maxUnavailable", wantDetail: "a valid percent string"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := field.NewPath("test")
+			errs := ValidateUnknownTargetRollingUpdateBudget(&v1.RollingUpdateConfiguration{MaxSurge: tc.surge, MaxUnavailable: tc.unavailable}, path)
+			if tc.wantField == "" {
+				if len(errs) != 0 {
+					t.Fatalf("unexpected errors: %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || errs[0].Field != "test."+tc.wantField || !strings.Contains(errs[0].Detail, tc.wantDetail) {
+				t.Fatalf("want one error on test.%s containing %q, got %v", tc.wantField, tc.wantDetail, errs)
+			}
+		})
+	}
+
+	if errs := ValidateUnknownTargetRollingUpdateBudget(nil, field.NewPath("test")); len(errs) != 0 {
+		t.Fatalf("unexpected errors for a nil configuration: %v", errs)
+	}
+}
+
+func TestGeneralValidateMaxGroupRestarts(t *testing.T) {
+	tests := []struct {
+		name      string
+		lws       *v1.LeaderWorkerSet
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name: "nil MaxGroupRestarts is always allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.NoneRestartPolicy).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "MaxGroupRestarts with RecreateGroupOnPodRestart is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				MaxGroupRestarts(3).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "MaxGroupRestarts with None policy is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.NoneRestartPolicy).
+				MaxGroupRestarts(1).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "maxGroupRestarts is only supported when restartPolicy recreates the group",
+		},
+		{
+			name: "MaxGroupRestarts with RecreateGroupAfterStart is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupAfterStart).
+				MaxGroupRestarts(0).
+				Obj(),
+			wantErr: false,
+		},
+	}
+
+	r := &LeaderWorkerSetWebhook{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := r.generalValidate(tc.lws)
+			if tc.wantErr {
+				if len(errs) == 0 {
+					t.Fatalf("expected validation error, got none")
+				}
+				joined := ""
+				for _, e := range errs {
+					joined += e.Error() + "\n"
+				}
+				if !strings.Contains(joined, tc.errSubstr) {
+					t.Fatalf("expected error to contain %q, got %q", tc.errSubstr, joined)
+				}
+			} else if len(errs) != 0 {
+				t.Fatalf("unexpected validation error: %v", errs.ToAggregate())
+			}
+		})
+	}
+}
+
+func TestGeneralValidateRestartBackoff(t *testing.T) {
+	tests := []struct {
+		name      string
+		lws       *v1.LeaderWorkerSet
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name: "nil RestartBackoff is always allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.NoneRestartPolicy).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "RestartBackoff with RecreateGroupOnPodRestart is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(10)), ptr.To(int32(300))).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "RestartBackoff with RecreateGroupAfterStart is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupAfterStart).
+				RestartBackoff(ptr.To(int32(5)), ptr.To(int32(60))).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "RestartBackoff with None policy is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.NoneRestartPolicy).
+				RestartBackoff(ptr.To(int32(10)), ptr.To(int32(300))).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "restartBackoff is only supported when restartPolicy recreates the group",
+		},
+		{
+			name: "RestartBackoff with non-positive Base is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(0)), ptr.To(int32(300))).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "must be greater than 0",
+		},
+		{
+			name: "RestartBackoff with non-positive Cap is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(10)), ptr.To(int32(-1))).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "must be greater than 0",
+		},
+		{
+			name: "RestartBackoff with Base > Cap is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(600)), ptr.To(int32(300))).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "baseSeconds must not be greater than capSeconds",
+		},
+		{
+			name: "RestartBackoff with nil Base and Cap < default Base is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(nil, ptr.To(int32(5))).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "baseSeconds must not be greater than capSeconds",
+		},
+		{
+			name: "RestartBackoff with Base > default Cap and nil Cap is rejected",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(600)), nil).
+				Obj(),
+			wantErr:   true,
+			errSubstr: "baseSeconds must not be greater than capSeconds",
+		},
+		{
+			name: "RestartBackoff with valid single-field Base is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(ptr.To(int32(20)), nil).
+				Obj(),
+			wantErr: false,
+		},
+		{
+			name: "RestartBackoff with valid single-field Cap is allowed",
+			lws: wrappers.BuildLeaderWorkerSet("default").
+				RestartPolicy(v1.RecreateGroupOnPodRestart).
+				RestartBackoff(nil, ptr.To(int32(60))).
+				Obj(),
+			wantErr: false,
+		},
+	}
+
+	r := &LeaderWorkerSetWebhook{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := r.generalValidate(tc.lws)
+			if tc.wantErr {
+				if len(errs) == 0 {
+					t.Fatalf("expected validation error, got none")
+				}
+				joined := ""
+				for _, e := range errs {
+					joined += e.Error() + "\n"
+				}
+				if !strings.Contains(joined, tc.errSubstr) {
+					t.Fatalf("expected error to contain %q, got %q", tc.errSubstr, joined)
+				}
+			} else if len(errs) != 0 {
+				t.Fatalf("unexpected validation error: %v", errs.ToAggregate())
+			}
+		})
+	}
+}
+
+func TestRestartBackoffDefaulting(t *testing.T) {
+	r := &LeaderWorkerSetWebhook{}
+	lws := wrappers.BuildLeaderWorkerSet("default").
+		RestartPolicy(v1.RecreateGroupOnPodRestart).
+		Obj()
+	lws.Spec.LeaderWorkerTemplate.RestartBackoff = &v1.RestartBackoff{}
+
+	if err := r.Default(context.Background(), lws); err != nil {
+		t.Fatalf("unexpected defaulting error: %v", err)
+	}
+
+	backoff := lws.Spec.LeaderWorkerTemplate.RestartBackoff
+	if backoff.BaseSeconds == nil || *backoff.BaseSeconds != v1.DefaultRestartBackoffBaseSeconds {
+		t.Errorf("expected default BaseSeconds %d, got %v", v1.DefaultRestartBackoffBaseSeconds, backoff.BaseSeconds)
+	}
+	if backoff.CapSeconds == nil || *backoff.CapSeconds != v1.DefaultRestartBackoffCapSeconds {
+		t.Errorf("expected default CapSeconds %d, got %v", v1.DefaultRestartBackoffCapSeconds, backoff.CapSeconds)
+	}
+}
+
+func TestLeaderWorkerSetValidation(t *testing.T) {
+	webhook := &LeaderWorkerSetWebhook{}
+	ctx := context.Background()
+
+	t.Run("nil replicas should be defaulted", func(t *testing.T) {
+		lws := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-lws",
+				Namespace: "default",
+			},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: nil, // nil replicas
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+				},
+				RolloutStrategy: v1.RolloutStrategy{
+					Type: v1.RollingUpdateStrategyType,
+					RollingUpdateConfiguration: &v1.RollingUpdateConfiguration{
+						MaxUnavailable: intstr.FromInt32(1),
+						MaxSurge:       intstr.FromInt32(0),
+						Partition:      ptr.To[int32](0),
+					},
+				},
+			},
+		}
+		if err := webhook.Default(ctx, lws); err != nil {
+			t.Fatalf("defaulting LeaderWorkerSet: %v", err)
+		}
+		if diff := cmp.Diff(ptr.To[int32](1), lws.Spec.Replicas); diff != "" {
+			t.Errorf("unexpected replicas (-want +got):\n%s", diff)
+		}
+		if _, err := webhook.ValidateCreate(ctx, lws); err != nil {
+			t.Errorf("validating defaulted LeaderWorkerSet: %v", err)
+		}
+	})
+
+	t.Run("nil rolling update configuration should not panic", func(t *testing.T) {
+		lws := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-lws",
+				Namespace: "default",
+			},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](2),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+				},
+				RolloutStrategy: v1.RolloutStrategy{
+					Type:                       v1.RollingUpdateStrategyType,
+					RollingUpdateConfiguration: nil, // nil configuration
+				},
+			},
+		}
+		if err := webhook.Default(ctx, lws); err != nil {
+			t.Fatalf("defaulting LeaderWorkerSet: %v", err)
+		}
+		if lws.Spec.RolloutStrategy.RollingUpdateConfiguration == nil {
+			t.Fatal("expected rollingUpdateConfiguration to be defaulted")
+		}
+		if _, err := webhook.ValidateCreate(ctx, lws); err != nil {
+			t.Errorf("validating defaulted LeaderWorkerSet: %v", err)
+		}
+	})
+
+	t.Run("missing subgroup size should return a validation error", func(t *testing.T) {
+		lws := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-lws",
+				Namespace: "default",
+			},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](1),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size:           ptr.To[int32](2),
+					SubGroupPolicy: &v1.SubGroupPolicy{},
+				},
+			},
+		}
+
+		allErrs := webhook.generalValidate(lws)
+		if len(allErrs) != 1 {
+			t.Fatalf("expected one validation error for missing subGroupSize, got %v", allErrs)
+		}
+		if allErrs[0].Type != field.ErrorTypeRequired {
+			t.Errorf("expected required error, got %q", allErrs[0].Type)
+		}
+	})
+
+	t.Run("zero subgroup size should return a validation error", func(t *testing.T) {
+		lws := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-lws",
+				Namespace: "default",
+			},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](1),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+					SubGroupPolicy: &v1.SubGroupPolicy{
+						SubGroupSize: ptr.To[int32](0),
+					},
+				},
+			},
+		}
+
+		allErrs := webhook.generalValidate(lws)
+		if len(allErrs) != 1 {
+			t.Fatalf("expected one validation error for zero subGroupSize, got %v", allErrs)
+		}
+		if allErrs[0].Type != field.ErrorTypeInvalid {
+			t.Errorf("expected invalid error, got %q", allErrs[0].Type)
+		}
+	})
+
+	t.Run("nil subgroup size on update should not panic", func(t *testing.T) {
+		oldLWS := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](1),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+					SubGroupPolicy: &v1.SubGroupPolicy{
+						SubGroupSize: nil,
+					},
+				},
+			},
+		}
+		newLWS := oldLWS.DeepCopy()
+		newLWS.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize = ptr.To[int32](1)
+
+		if _, err := webhook.ValidateUpdate(ctx, oldLWS, newLWS); err != nil {
+			t.Errorf("expected update from a legacy nil subGroupSize to succeed, got: %v", err)
+		}
+	})
+
+	t.Run("nil new subgroup size on update should return a validation error", func(t *testing.T) {
+		oldLWS := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](1),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+					SubGroupPolicy: &v1.SubGroupPolicy{
+						SubGroupSize: ptr.To[int32](1),
+					},
+				},
+			},
+		}
+		newLWS := oldLWS.DeepCopy()
+		newLWS.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize = nil
+
+		if _, err := webhook.ValidateUpdate(ctx, oldLWS, newLWS); err == nil {
+			t.Fatal("expected validation error for a nil subGroupSize")
+		}
+	})
+
+	t.Run("nil old network config on update should not panic", func(t *testing.T) {
+		oldLWS := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas: ptr.To[int32](1),
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](1),
+				},
+				NetworkConfig: nil,
+			},
+		}
+		newLWS := oldLWS.DeepCopy()
+		newLWS.Spec.NetworkConfig = &v1.NetworkConfig{}
+
+		if _, err := webhook.ValidateUpdate(ctx, oldLWS, newLWS); err == nil {
+			t.Fatal("expected validation error for a nil subdomainPolicy")
+		}
+	})
+
+	t.Run("immutable scheduling fields on update should return a validation error", func(t *testing.T) {
+		schedWebhook := &LeaderWorkerSetWebhook{SchedulerProvider: schedulerprovider.Kubernetes}
+		oldLWS := &v1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+			Spec: v1.LeaderWorkerSetSpec{
+				Replicas:      ptr.To[int32](2),
+				StartupPolicy: v1.LeaderCreatedStartupPolicy,
+				Scheduling:    &v1.LeaderWorkerSetScheduling{},
+				LeaderWorkerTemplate: v1.LeaderWorkerTemplate{
+					Size: ptr.To[int32](2),
+				},
+			},
+		}
+		newLWS := oldLWS.DeepCopy()
+		newLWS.Spec.Scheduling.Replica = &v1.LeaderWorkerSetReplicaScheduling{
+			SchedulingPolicy: &schedulingv1alpha3.WorkloadCompositePodGroupSchedulingPolicy{
+				Basic: &schedulingv1alpha3.WorkloadCompositePodGroupBasicSchedulingPolicy{},
+			},
+		}
+
+		if _, err := schedWebhook.ValidateUpdate(ctx, oldLWS, newLWS); err == nil {
+			t.Fatal("expected validation error when changing schedulingPolicy on update")
+		}
+	})
+}
+
+func TestPodTerminationPolicyDefaultAndValidation(t *testing.T) {
+	ctx := context.TODO()
+	webhook := &LeaderWorkerSetWebhook{}
+
+	t.Run("defaulting sets Sequential policy", func(t *testing.T) {
+		lws := wrappers.BuildLeaderWorkerSet("test-lws").Obj()
+		lws.Spec.PodTerminationPolicy = ""
+		if err := webhook.Default(ctx, lws); err != nil {
+			t.Fatalf("unexpected error during defaulting: %v", err)
+		}
+		if lws.Spec.PodTerminationPolicy != v1.SequentialPodTerminationPolicy {
+			t.Errorf("expected podTerminationPolicy to default to %q, got %q", v1.SequentialPodTerminationPolicy, lws.Spec.PodTerminationPolicy)
+		}
+	})
+
+	t.Run("validate create accepts valid policies", func(t *testing.T) {
+		for _, policy := range []v1.PodTerminationPolicyType{v1.SequentialPodTerminationPolicy, v1.ParallelPodTerminationPolicy} {
+			lws := wrappers.BuildLeaderWorkerSet("test-lws").Obj()
+			lws.Spec.PodTerminationPolicy = policy
+			if _, err := webhook.ValidateCreate(ctx, lws); err != nil {
+				t.Errorf("expected policy %q to be accepted, got error: %v", policy, err)
+			}
+		}
+	})
+
+	t.Run("validate create rejects invalid policy", func(t *testing.T) {
+		lws := wrappers.BuildLeaderWorkerSet("test-lws").Obj()
+		lws.Spec.PodTerminationPolicy = "InvalidPolicy"
+		if _, err := webhook.ValidateCreate(ctx, lws); err == nil {
+			t.Errorf("expected invalid policy to be rejected")
+		}
+	})
+
+	t.Run("validate update rejects mutating policy", func(t *testing.T) {
+		oldLWS := wrappers.BuildLeaderWorkerSet("test-lws").Obj()
+		oldLWS.Spec.PodTerminationPolicy = v1.SequentialPodTerminationPolicy
+
+		newLWS := oldLWS.DeepCopy()
+		newLWS.Spec.PodTerminationPolicy = v1.ParallelPodTerminationPolicy
+
+		if _, err := webhook.ValidateUpdate(ctx, oldLWS, newLWS); err == nil {
+			t.Errorf("expected policy update from Sequential to Parallel to be rejected as immutable")
+		}
+
+		// Reverting back to Sequential should also be rejected
+		parallelLWS := oldLWS.DeepCopy()
+		parallelLWS.Spec.PodTerminationPolicy = v1.ParallelPodTerminationPolicy
+		sequentialLWS := oldLWS.DeepCopy()
+		sequentialLWS.Spec.PodTerminationPolicy = v1.SequentialPodTerminationPolicy
+		if _, err := webhook.ValidateUpdate(ctx, parallelLWS, sequentialLWS); err == nil {
+			t.Errorf("expected policy update from Parallel to Sequential to be rejected as immutable")
+		}
+
+		// Same policy should succeed
+		sameLWS := oldLWS.DeepCopy()
+		sameLWS.Spec.PodTerminationPolicy = v1.SequentialPodTerminationPolicy
+		if _, err := webhook.ValidateUpdate(ctx, oldLWS, sameLWS); err != nil {
+			t.Errorf("expected same policy update to be accepted, got: %v", err)
+		}
+
+		// Updating when unset/empty on old and Sequential on new should succeed (both normalize to Sequential)
+		emptyLWS := oldLWS.DeepCopy()
+		emptyLWS.Spec.PodTerminationPolicy = ""
+		if _, err := webhook.ValidateUpdate(ctx, emptyLWS, sequentialLWS); err != nil {
+			t.Errorf("expected empty to Sequential update to be accepted, got: %v", err)
+		}
+	})
 }

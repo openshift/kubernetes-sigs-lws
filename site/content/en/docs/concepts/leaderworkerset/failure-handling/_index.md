@@ -1,0 +1,139 @@
+---
+title: "Failure Handling and Restart Policies"
+linkTitle: "Failure Handling"
+weight: 70
+description: >
+  Learn how LeaderWorkerSet handles pod and node failures with configurable restart policies.
+aliases:
+- /docs/concepts/failure-handling/
+---
+
+LeaderWorkerSet provides configurable failure handling for pod groups, ensuring that pod and node failures in distributed workloads are handled consistently according to the coupling requirements of the application.
+
+Configure the failure and restart behavior via `.spec.leaderWorkerTemplate.restartPolicy`:
+
+### RecreateGroupOnPodRestart (Default)
+
+When any pod in a group fails or restarts, the entire replica group (leader + all workers) is deleted and recreated.
+
+- **Pod Failures:** If a single container or pod fails or restarts, all other pods in the group are terminated and recreated simultaneously to ensure all processes restart fresh and re-initialize collective communication or distributed caches cleanly.
+- **Node Failures:** When a node hosting any pod in the replica fails or becomes unreachable, the entire replica group is deleted and recreated on healthy nodes, respecting topology placement constraints.
+- **Primary Use Case:** Tightly coupled multi-host distributed inference and training (e.g., tensor-parallel or pipeline-parallel models) where a single pod or node failure breaks collective communication.
+
+{{< include file="examples/leaderworkerset/failure-handling/recreate-group-on-pod-restart.yaml" lang="yaml" >}}
+
+### None
+
+Only the failed pod is restarted or rescheduled. Other pods in the group continue running without interruption.
+
+- **Pod Failures:** If an individual pod or container fails, only that specific pod is restarted by Kubernetes.
+- **Node Failures:** When a node fails, only the pods residing on that failed node are rescheduled. Other pods in the replica remain running on their existing nodes.
+- **Primary Use Case:** Loosely coupled workers or workloads with application-level fault tolerance where individual pods can reconnect or recover independently.
+
+{{< include file="examples/leaderworkerset/failure-handling/none.yaml" lang="yaml" >}}
+
+### RecreateGroupAfterStart
+
+When any pod in a group fails, the entire group is recreated **if and only if there are no pods currently pending** in the group. If any pod in the replica is still in the `Pending` phase (e.g., during image pulls or initial scheduling), the controller skips the failure event without triggering a group-wide recreation. If the pod is `Pending` because the scheduler could not place it, the controller also records a `GroupUnschedulable` warning event and reports it on the `Progressing` condition, as described below.
+
+- **Pod Failures:** Recreates the entire group if a pod fails after all pods in the replica have started (no pods are `Pending`). If any pod in the replica is `Pending`, the failure event is skipped, allowing Kubernetes to handle pod restarts individually and preventing restart cascades during rollout.
+- **Node Failures:** If a node fails after all pods in the replica have started, the entire replica group is deleted and recreated on healthy nodes. If the failure occurs while any pod in the replica is `Pending`, group recreation is not triggered.
+- **Primary Use Case:** Workloads with large container images or long startup times where you want strict collective restart semantics in production once running, but want to prevent recreation loops during the initial rollout.
+
+A `Pending` pod can be in one of three states, and LWS does not recreate the group in any of them. A pod that has no `PodScheduled` condition yet, because the scheduler has not reported a result for it, is treated as starting.
+
+- **Held by a scheduling gate** (`PodScheduled=False` with reason `SchedulingGated`): the scheduler has not tried to place the pod yet. Every leader starts gated until LWS admits it, so a gated leader may not have worker pods yet.
+- **Placed and starting** (`PodScheduled=True`): the pod is on a node and is pulling images or starting containers.
+- **Unschedulable** (`PodScheduled=False` with any other reason, such as `Unschedulable`): the scheduler tried and failed to place the pod, for example while a gang-scheduled group waits for capacity. LWS keeps waiting rather than recreate a group that cannot be placed, and records a `GroupUnschedulable` warning event when it skips a recreation. While a leader is unschedulable, the LWS `Progressing` condition also has reason `GroupUnschedulable` and reports how many replicas cannot be scheduled.
+
+{{% alert title="Note" color="info" %}}
+The `RecreateGroupAfterStart` restart policy is supported in LWS version 0.9.0+.
+{{% /alert %}}
+
+{{< include file="examples/leaderworkerset/failure-handling/recreate-group-after-start.yaml" lang="yaml" >}}
+
+## Limit Automatic Group Recreation
+
+For `RecreateGroupOnPodRestart` and `RecreateGroupAfterStart`, set
+`maxGroupRestarts` to limit how many times LWS can automatically recreate each
+replica group. When the field is unset, group recreation remains unlimited. A
+value of `0` disables automatic group recreation on the first qualifying
+failure.
+
+{{< include file="examples/leaderworkerset/failure-handling/bounded-group-recovery.yaml" lang="yaml" >}}
+
+The budget is tracked independently for each replica group and Pod template
+revision. It is consumed only when LWS initiates a group recreation. The field
+is supported with both `Ordinal` and `Hash` [group identity](../group-identity/)
+modes, and is not supported with `restartPolicy: None`. In `Hash` mode, a
+recreated group receives a new group key, and LWS transfers the recreating
+group's restart count when admitting the replacement leader so the budget
+persists across replacements.
+
+When a group exhausts its budget, LWS:
+
+1. Terminates the leader and worker Pods to release their scheduled resources.
+2. Retains Pod API objects that can still receive cleanup finalizers and stops
+   automatic recreation of that group (in `Hash` mode, the retained leader holds
+   back its gated replacement leader under both `PostTermination` and
+   `Immediate` replacement policies). A Pod that was already deleting may
+   disappear because Kubernetes does not allow adding a finalizer at that point.
+3. Sets `Degraded=True` with reason `ReplicaRestartBudgetExceeded`. Other
+   replica groups continue running.
+
+{{% alert title="Kubernetes version requirement" color="warning" %}}
+Budget exhaustion handling requires Kubernetes 1.27 or later. It relies on the
+[Kubernetes 1.27+ Pod deletion flow](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#termination-of-pods)
+to stop containers and transition deleted Pods to a terminal phase while
+finalizers retain their API objects. The general LWS minimum Kubernetes version
+remains unchanged.
+{{% /alert %}}
+
+Retaining a Pod API object preserves its status, but does not guarantee that
+`kubectl logs` remains available after the container runtime removes the
+terminated container. Use an external logging system when logs must survive
+group termination.
+
+### Recover an Exhausted Group
+
+After fixing the underlying problem, explicitly recover one exhausted group by
+annotating its retained leader Pod:
+
+```shell
+kubectl annotate pod <leader-pod-name> leaderworkerset.sigs.k8s.io/recover=true
+```
+
+LWS then clears that group's count, removes the cleanup finalizers, and allows
+a replacement group to start (created by the StatefulSet in `Ordinal` mode, or
+admitted from the gated replacement leader in `Hash` mode) with a fresh budget.
+Editing or unsetting `maxGroupRestarts`, or deleting retained Pods, does not
+recover an exhausted group. LWS deletion, scale-down, and selecting the group
+for replacement during a rollout remove retained objects as normal lifecycle
+cleanup rather than starting recovery.
+
+## Group Restart Backoff
+
+For `RecreateGroupOnPodRestart` and `RecreateGroupAfterStart`, set `restartBackoff` to space out tight recreation loops by applying an exponential backoff delay before recreating each replica group:
+
+```yaml
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: example
+spec:
+  leaderWorkerTemplate:
+    restartPolicy: RecreateGroupOnPodRestart
+    restartBackoff:
+      baseSeconds: 10
+      capSeconds: 300
+```
+
+- **Delay Calculation:** The backoff delay is computed as `min(baseSeconds * 2^count, capSeconds)`. The default `baseSeconds` is 10 and `capSeconds` is 300.
+- **Clock Semantics:** The delay enforces that a group must have existed for at least `min(baseSeconds * 2^count, capSeconds)` before it can be recreated. The delay is measured from **leader Pod creation time**, not from the failure time. A group that has run stably for longer than the computed delay recovers immediately on failure, providing a reset mechanism analogous to CrashLoopBackOff.
+- **Shared Restart Counter:** `restartBackoff` reads and increments the same per-group restart counter as `maxGroupRestarts`. Both features can be used together: `restartBackoff` spaces out recreations while `maxGroupRestarts` places an upper bound on total automatic recreation attempts.
+- **Worker Failure During Backoff:** When a recreation is triggered by a deleted worker and deferred by backoff, the leader pod remains until the backoff delay elapses before deleting the group. While deferred, LWS emits a `GroupRestartBackoff` event on the LeaderWorkerSet with the remaining delay and restart count.
+
+## Accelerate Group Rebuild and Teardown
+
+To reduce teardown and recreation latency when groups are deleted or rebuilt, you can configure `.spec.podTerminationPolicy: Parallel`. This enables concurrent termination of leader and worker pods instead of waiting for sequential cascading deletion. See [Pod Termination Policy](../pod-termination-policy/) for details.
+

@@ -1,7 +1,7 @@
 # The LeaderWorkerSet and DisaggregatedSet APIs
 
 [![Latest Release](https://img.shields.io/github/v/release/kubernetes-sigs/lws?include_prereleases)](https://github.com/kubernetes-sigs/lws/releases/latest)
-[![Coverage Status](https://coveralls.io/repos/github/kubernetes-sigs/lws/badge.svg?branch=test-coverage)](https://coveralls.io/github/kubernetes-sigs/lws?branch=test-coverage)
+[![Coverage Status](https://coveralls.io/repos/github/kubernetes-sigs/lws/badge.svg?branch=main)](https://coveralls.io/github/kubernetes-sigs/lws?branch=main)
 
 <img src="site/static/images/lws-ds-logos.svg" width="300" alt="lws logo">
 
@@ -16,7 +16,7 @@ Read the [documentation](https://lws.sigs.k8s.io/docs/) or watch the [related ta
 
 ## Feature overview
 
-### Core LeaderWorkerSet (LWS) Features
+### Core Features: LeaderWorkerSet
 - **Group of Pods as a unit:** Supports a tightly managed group of pods that represent a “super pod”
   - **Unique pod identity:** Each pod in the group has a unique index from 0 to n-1.
   - **Parallel creation:** Pods in the group will have the same lifecycle and be created in parallel.
@@ -32,7 +32,7 @@ Read the [documentation](https://lws.sigs.k8s.io/docs/) or watch the [related ta
   <img src="site/static/images/lws-concept.svg" width="550" alt="LWS Concept">
 </p>
 
-### Advanced DisaggregatedSet Features
+### Advanced Features: DisaggregatedSet
 - **Disaggregated Architecture Support:** Specifically designed for workloads where different phases (e.g., prefill and decode) run on separate infrastructure.
 - **Coordinated N-Dimensional Rollouts:** Updates multiple roles (2-10) in lockstep, preserving capacity ratios throughout the update process.
 - **Unified Lifecycle Management:** Manages multiple underlying LeaderWorkerSets as a single logical unit.
@@ -43,13 +43,29 @@ Read the [documentation](https://lws.sigs.k8s.io/docs/) or watch the [related ta
   <img src="site/static/images/ds-concept.svg" width="700" alt="DisaggregatedSet Concept">
 </p>
 
+## Compatibility
+
+LeaderWorkerSet maintains support for the latest Kubernetes minor versions (currently tested on Kubernetes 1.34 through 1.37).
+
+### Test Coverage
+
+- Unit Tests: [TestGrid](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-unit-main)
+- Integration Tests: [TestGrid](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-integration-main)
+- E2E Tests:
+  - Kubernetes [1.34](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-e2e-main-1-34) on KIND
+  - Kubernetes [1.35](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-e2e-main-1-35) on KIND
+  - Kubernetes [1.36](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-e2e-main-1-36) on KIND
+  - Kubernetes [1.37](https://testgrid.k8s.io/sig-apps-lws-presubmits#pull-lws-test-e2e-main-1-37) on KIND
+
 ## Installation
+
+**Officially supported and tested on Kubernetes 1.34 or newer.**
 
 Read the [installation guide](https://lws.sigs.k8s.io/docs/installation/) to learn more.
 
 ## Examples
 
-Read the [examples](/docs/examples/sample/README.md) to learn more.
+Read the [examples](https://lws.sigs.k8s.io/docs/examples/) to learn more.
 
 Also discover adopters, integrations, and talks [here](https://lws.sigs.k8s.io/docs/adoption/#talks-and-presentations).
 

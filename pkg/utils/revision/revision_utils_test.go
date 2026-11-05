@@ -17,18 +17,151 @@ limitations under the License.
 package revision
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/lru"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/test/wrappers"
 )
+
+func TestNewRevisionIgnoresMaxGroupRestarts(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+
+	withoutBudget := wrappers.BuildLeaderWorkerSet("default").MaxGroupRestarts(1).Obj()
+	withDifferentBudget := withoutBudget.DeepCopy()
+	otherBudget := int32(2)
+	withDifferentBudget.Spec.LeaderWorkerTemplate.MaxGroupRestarts = &otherBudget
+
+	first, err := NewRevision(context.TODO(), client, withoutBudget, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewRevision(context.TODO(), client, withDifferentBudget, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(first.Data.Raw, second.Data.Raw) {
+		t.Fatalf("maxGroupRestarts must not change revision data: first=%s second=%s", first.Data.Raw, second.Data.Raw)
+	}
+	if first.Name != second.Name {
+		t.Fatalf("maxGroupRestarts must not change revision identity: first=%q second=%q", first.Name, second.Name)
+	}
+	if bytes.Contains(first.Data.Raw, []byte("maxGroupRestarts")) {
+		t.Fatalf("revision data unexpectedly contains maxGroupRestarts: %s", first.Data.Raw)
+	}
+}
+
+func TestApplyRevisionPreservesMaxGroupRestarts(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+
+	source := wrappers.BuildLeaderWorkerSet("default").MaxGroupRestarts(1).Obj()
+	revision, err := NewRevision(context.TODO(), client, source, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a revision created before maxGroupRestarts was removed from the
+	// revision patch. ApplyRevision must preserve the live budget even then.
+	var patch map[string]interface{}
+	if err := json.Unmarshal(revision.Data.Raw, &patch); err != nil {
+		t.Fatal(err)
+	}
+	spec := patch["spec"].(map[string]interface{})
+	template := spec["leaderWorkerTemplate"].(map[string]interface{})
+	template["maxGroupRestarts"] = float64(1)
+	revision.Data.Raw, err = json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := source.DeepCopy()
+	currentBudget := int32(7)
+	live.Spec.LeaderWorkerTemplate.MaxGroupRestarts = &currentBudget
+	restored, err := ApplyRevision(live, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Spec.LeaderWorkerTemplate.MaxGroupRestarts == nil {
+		t.Fatal("ApplyRevision cleared the live maxGroupRestarts budget")
+	}
+	if got := *restored.Spec.LeaderWorkerTemplate.MaxGroupRestarts; got != currentBudget {
+		t.Fatalf("ApplyRevision restored maxGroupRestarts=%d, want %d", got, currentBudget)
+	}
+}
+
+func TestNewRevisionIgnoresRestartBackoff(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+
+	withoutBackoff := wrappers.BuildLeaderWorkerSet("default").
+		RestartBackoff(ptr.To(int32(10)), ptr.To(int32(300))).
+		Obj()
+	withDifferentBackoff := withoutBackoff.DeepCopy()
+	withDifferentBackoff.Spec.LeaderWorkerTemplate.RestartBackoff = &leaderworkerset.RestartBackoff{
+		BaseSeconds: ptr.To(int32(20)),
+		CapSeconds:  ptr.To(int32(600)),
+	}
+
+	first, err := NewRevision(context.TODO(), client, withoutBackoff, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewRevision(context.TODO(), client, withDifferentBackoff, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(first.Data.Raw, second.Data.Raw) {
+		t.Fatalf("restartBackoff must not change revision data: first=%s second=%s", first.Data.Raw, second.Data.Raw)
+	}
+	if first.Name != second.Name {
+		t.Fatalf("restartBackoff must not change revision identity: first=%q second=%q", first.Name, second.Name)
+	}
+	if bytes.Contains(first.Data.Raw, []byte("restartBackoff")) {
+		t.Fatalf("revision data unexpectedly contains restartBackoff: %s", first.Data.Raw)
+	}
+}
+
+func TestApplyRevisionPreservesRestartBackoff(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+
+	source := wrappers.BuildLeaderWorkerSet("default").
+		RestartBackoff(ptr.To(int32(10)), ptr.To(int32(300))).
+		Obj()
+	revision, err := NewRevision(context.TODO(), client, source, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := source.DeepCopy()
+	currentBackoff := &leaderworkerset.RestartBackoff{
+		BaseSeconds: ptr.To(int32(15)),
+		CapSeconds:  ptr.To(int32(180)),
+	}
+	live.Spec.LeaderWorkerTemplate.RestartBackoff = currentBackoff
+	restored, err := ApplyRevision(live, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Spec.LeaderWorkerTemplate.RestartBackoff == nil {
+		t.Fatal("ApplyRevision cleared the live restartBackoff")
+	}
+	if diff := cmp.Diff(restored.Spec.LeaderWorkerTemplate.RestartBackoff, currentBackoff); diff != "" {
+		t.Fatalf("ApplyRevision restored restartBackoff mismatch (-want +got):\n%s", diff)
+	}
+}
 
 func TestApplyRevision(t *testing.T) {
 	client := fake.NewClientBuilder().Build()
@@ -267,5 +400,232 @@ func TestGetHighestRevision(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGetRevisionKey(t *testing.T) {
+	t.Run("returns the revision label when present", func(t *testing.T) {
+		lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+		lws.Labels = map[string]string{leaderworkerset.RevisionKey: "abc123"}
+		if got := GetRevisionKey(lws); got != "abc123" {
+			t.Fatalf("GetRevisionKey()=%q, want %q", got, "abc123")
+		}
+	})
+	t.Run("returns empty when labels are nil", func(t *testing.T) {
+		lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+		lws.Labels = nil
+		if got := GetRevisionKey(lws); got != "" {
+			t.Fatalf("GetRevisionKey()=%q, want empty", got)
+		}
+	})
+	t.Run("returns empty when the label is absent", func(t *testing.T) {
+		lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+		lws.Labels = map[string]string{"other": "x"}
+		if got := GetRevisionKey(lws); got != "" {
+			t.Fatalf("GetRevisionKey()=%q, want empty", got)
+		}
+	})
+}
+
+func TestRevisionName(t *testing.T) {
+	if got := revisionName("lws", "h4sh", 3); got != "lws-h4sh-3" {
+		t.Fatalf("revisionName()=%q, want %q", got, "lws-h4sh-3")
+	}
+	long := strings.Repeat("a", 230)
+	got := revisionName(long, "h4sh", 1)
+	if want := strings.Repeat("a", 220) + "-h4sh-1"; got != want {
+		t.Fatalf("revisionName() with long prefix = %d chars, want prefix truncated to 220", len(got))
+	}
+}
+
+func TestHashRevision(t *testing.T) {
+	a := &appsv1.ControllerRevision{Data: runtime.RawExtension{Raw: []byte(`{"a":1}`)}}
+	b := &appsv1.ControllerRevision{Data: runtime.RawExtension{Raw: []byte(`{"a":1}`)}}
+	c := &appsv1.ControllerRevision{Data: runtime.RawExtension{Raw: []byte(`{"a":2}`)}}
+	if hashRevision(a) != hashRevision(b) {
+		t.Fatalf("identical data must hash identically")
+	}
+	if hashRevision(a) == hashRevision(c) {
+		t.Fatalf("different data must hash differently")
+	}
+	empty := &appsv1.ControllerRevision{}
+	if hashRevision(empty) == "" {
+		t.Fatalf("empty revision must still produce a hash")
+	}
+}
+
+func TestGetRevisionAndTruncate(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+	ctx := context.Background()
+	lws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	lws.UID = types.UID("owner-uid")
+
+	mk := func(key string, number int64) *appsv1.ControllerRevision {
+		cr, err := NewRevision(ctx, client, lws, key)
+		if err != nil {
+			t.Fatalf("NewRevision: %v", err)
+		}
+		cr.Revision = number
+		cr.Name = revisionName(lws.Name, key, number)
+		if _, err := CreateRevision(ctx, client, cr); err != nil {
+			t.Fatalf("CreateRevision: %v", err)
+		}
+		return cr
+	}
+
+	t.Run("empty key returns nil without listing", func(t *testing.T) {
+		got, err := GetRevision(ctx, client, lws, "")
+		if err != nil || got != nil {
+			t.Fatalf("GetRevision(\"\")=%v,%v want nil,nil", got, err)
+		}
+	})
+
+	t.Run("no matching revision returns nil", func(t *testing.T) {
+		got, err := GetRevision(ctx, client, lws, "missing")
+		if err != nil || got != nil {
+			t.Fatalf("GetRevision(missing)=%v,%v want nil,nil", got, err)
+		}
+	})
+
+	keyA1 := mk("key-a", 1)
+	mk("key-b", 2)
+	keyA3 := mk("key-a", 3)
+
+	t.Run("single match is returned", func(t *testing.T) {
+		got, err := GetRevision(ctx, client, lws, "key-b")
+		if err != nil || got == nil || got.Revision != 2 {
+			t.Fatalf("GetRevision(key-b)=%v,%v want revision 2", got, err)
+		}
+	})
+
+	t.Run("multiple matches return the highest revision", func(t *testing.T) {
+		got, err := GetRevision(ctx, client, lws, "key-a")
+		if err != nil || got == nil {
+			t.Fatalf("GetRevision(key-a)=%v,%v", got, err)
+		}
+		if got.Name != keyA3.Name || got.Name == keyA1.Name {
+			t.Fatalf("GetRevision(key-a) returned %s, want %s", got.Name, keyA3.Name)
+		}
+	})
+
+	t.Run("revisions owned by another controller are ignored", func(t *testing.T) {
+		other := wrappers.BuildLeaderWorkerSet("default").Obj()
+		other.Name = lws.Name // same name label, different owner UID
+		other.UID = types.UID("other-uid")
+		cr, err := NewRevision(ctx, client, other, "key-c")
+		if err != nil {
+			t.Fatalf("NewRevision: %v", err)
+		}
+		cr.Revision = 9
+		cr.Name = revisionName("other", "key-c", 9)
+		if _, err := CreateRevision(ctx, client, cr); err != nil {
+			t.Fatalf("CreateRevision: %v", err)
+		}
+		got, err := GetRevision(ctx, client, lws, "key-c")
+		if err != nil || got != nil {
+			t.Fatalf("GetRevision(key-c) must not see another controller's revision, got %v,%v", got, err)
+		}
+	})
+
+	t.Run("truncate keeps only the current key", func(t *testing.T) {
+		if err := TruncateRevisions(ctx, client, lws, "key-a"); err != nil {
+			t.Fatalf("TruncateRevisions: %v", err)
+		}
+		list := &appsv1.ControllerRevisionList{}
+		if err := client.List(ctx, list); err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		var mine []string
+		for i := range list.Items {
+			ref := metav1.GetControllerOfNoCopy(&list.Items[i])
+			if ref != nil && ref.UID == lws.UID {
+				mine = append(mine, GetRevisionKey(&list.Items[i]))
+			}
+		}
+		if len(mine) != 2 || mine[0] != "key-a" || mine[1] != "key-a" {
+			t.Fatalf("after truncate, owned revision keys = %v, want two key-a", mine)
+		}
+		if len(list.Items) != 3 {
+			t.Fatalf("truncate must not touch another controller's revision, total=%d want 3", len(list.Items))
+		}
+	})
+}
+
+func TestAutoComputeDomainRevisionTracking(t *testing.T) {
+	client := fake.NewClientBuilder().Build()
+	ctx := context.Background()
+
+	unsetLws := wrappers.BuildLeaderWorkerSet("default").Obj()
+	unsetLws.UID = types.UID("lws-uid")
+	unsetLws.Generation = 1
+
+	disabledLws := unsetLws.DeepCopy()
+	disabledLws.Annotations = map[string]string{
+		leaderworkerset.AutoComputeDomainAnnotationKey: leaderworkerset.AutoComputeDomainDisabled,
+	}
+
+	enabledLws := unsetLws.DeepCopy()
+	enabledLws.Annotations = map[string]string{
+		leaderworkerset.AutoComputeDomainAnnotationKey: leaderworkerset.AutoComputeDomainEnabled,
+	}
+
+	unsetRev, err := NewRevision(ctx, client, unsetLws, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledRev, err := NewRevision(ctx, client, disabledLws, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabledRev, err := NewRevision(ctx, client, enabledLws, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unset and "disabled" must produce byte-identical revision patches for upgrade safety.
+	if !bytes.Equal(unsetRev.Data.Raw, disabledRev.Data.Raw) {
+		t.Fatalf("unset and disabled auto-compute-domain must produce identical patches:\nunset=%s\ndisabled=%s", unsetRev.Data.Raw, disabledRev.Data.Raw)
+	}
+	if bytes.Contains(unsetRev.Data.Raw, []byte(leaderworkerset.AutoComputeDomainAnnotationKey)) {
+		t.Fatalf("unset revision unexpectedly contains auto-compute-domain metadata: %s", unsetRev.Data.Raw)
+	}
+
+	// Enabling auto-compute-domain produces a new revision and SetMatchesRevision detects the change.
+	if EqualRevision(unsetRev, enabledRev) {
+		t.Fatalf("enabling auto-compute-domain must produce a new revision")
+	}
+	unsetRev.ResourceVersion = "1"
+	enabledRev.ResourceVersion = "2"
+	if SetMatchesRevision(enabledLws, enabledRev, unsetRev, lru.New(10)) {
+		t.Fatalf("SetMatchesRevision must detect enabling auto-compute-domain")
+	}
+	if SetMatchesRevision(disabledLws, disabledRev, enabledRev, lru.New(10)) {
+		t.Fatalf("SetMatchesRevision must detect disabling auto-compute-domain")
+	}
+
+	// An annotation-only change does not bump the generation, so a cached match
+	// for the same LWS generation and revision must not hide the toggle.
+	cache := lru.New(10)
+	if !SetMatchesRevision(unsetLws, unsetRev, unsetRev, cache) {
+		t.Fatalf("expected the unset LWS to match its own revision")
+	}
+	if SetMatchesRevision(enabledLws, enabledRev, unsetRev, cache) {
+		t.Fatalf("SetMatchesRevision must not reuse a cached match after enabling auto-compute-domain at the same generation")
+	}
+
+	// ApplyRevision restores historical non-MNNVL state onto an MNNVL-enabled live LWS and vice versa.
+	restoredDisabled, err := ApplyRevision(enabledLws, unsetRev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restoredDisabled.Annotations[leaderworkerset.AutoComputeDomainAnnotationKey]; ok {
+		t.Fatalf("expected ApplyRevision with non-MNNVL revision to clear auto-compute-domain, got %v", restoredDisabled.Annotations)
+	}
+	restoredEnabled, err := ApplyRevision(disabledLws, enabledRev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restoredEnabled.Annotations[leaderworkerset.AutoComputeDomainAnnotationKey]; got != leaderworkerset.AutoComputeDomainEnabled {
+		t.Fatalf("expected ApplyRevision with MNNVL revision to restore auto-compute-domain=enabled, got %q", got)
 	}
 }

@@ -33,14 +33,24 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 	// Group=leaderworkerset.x-k8s.io, Version=v1
 	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSet"):
 		return &leaderworkersetv1.LeaderWorkerSetApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetLeaderScheduling"):
+		return &leaderworkersetv1.LeaderWorkerSetLeaderSchedulingApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetReplicaScheduling"):
+		return &leaderworkersetv1.LeaderWorkerSetReplicaSchedulingApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetScheduling"):
+		return &leaderworkersetv1.LeaderWorkerSetSchedulingApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetSpec"):
 		return &leaderworkersetv1.LeaderWorkerSetSpecApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetStatus"):
 		return &leaderworkersetv1.LeaderWorkerSetStatusApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("LeaderWorkerSetWorkerScheduling"):
+		return &leaderworkersetv1.LeaderWorkerSetWorkerSchedulingApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("LeaderWorkerTemplate"):
 		return &leaderworkersetv1.LeaderWorkerTemplateApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("NetworkConfig"):
 		return &leaderworkersetv1.NetworkConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("RestartBackoff"):
+		return &leaderworkersetv1.RestartBackoffApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("RollingUpdateConfiguration"):
 		return &leaderworkersetv1.RollingUpdateConfigurationApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("RolloutStrategy"):

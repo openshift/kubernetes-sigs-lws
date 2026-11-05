@@ -8,12 +8,15 @@ description: >
 
 <!-- toc -->
 - [Before you begin](#before-you-begin)
-- [Install a released version](#install-a-released-version)
-  - [Uninstall](#uninstall)
+- [Install LWS](#install-a-released-version)
+- [Enable native gang scheduling](#enable-native-gang-scheduling)
+  - [Configure Kubernetes](#configure-kubernetes)
+  - [Configure LeaderWorkerSet](#configure-leaderworkerset)
+  - [Verify the prerequisites](#verify-the-prerequisites)
+{{% if-release %}}
 - [Install the latest development version](#install-the-latest-development-version)
-  - [Uninstall](#uninstall-1)
+{{% /if-release %}}
 - [Build and install from source](#build-and-install-from-source)
-  - [Uninstall](#uninstall-2)
 - [Install in a different namespace](#install-in-a-different-namespace)
 - [Optional: Use cert manager instead of internal cert](#optional-use-cert-manager-instead-of-internal-cert)
 - [Install with Helm chart](#install-with-helm-chart)
@@ -26,24 +29,42 @@ description: >
 
 Make sure the following conditions are met:
 
-- A Kubernetes cluster with version >= 1.26 is **Required**, or it will behave unexpected. Learn how to [install the Kubernetes tools](https://kubernetes.io/docs/tasks/tools/).
-    - For any cluster with version 1.26, you need to enable the [feature gate][feature_gate] for [Start Ordinal][start_ordinal] manually. For version greater than 1.26, it's enabled by default.
-    - Rolling update with max unavailable Pods, you must enable the [MaxUnavailableStatefulSet][max_unavailable] feature gate, which is still in alpha since Kubernetes v1.24, see discussion [here][max_unavailable_enhancement]. Or lws will roll out the pods one by one.
+- A Kubernetes cluster with version >= 1.34 is **required** (officially supported and tested on Kubernetes 1.34 through 1.37), or it may behave unexpectedly. Learn how to [install the Kubernetes tools](https://kubernetes.io/docs/tasks/tools/).
+    - On Kubernetes 1.34, enable the [MaxUnavailableStatefulSet][max_unavailable] feature gate for rolling updates with max unavailable Pods. It is enabled by default in Kubernetes 1.35 and later; see discussion [here][max_unavailable_enhancement].
 - Your cluster has at least 1 node with 1+ CPUs and 1G of memory available for the LeaderWorkerSet controller manager Deployment to run on. **NOTE: On some cloud providers, the default node machine type will not have sufficient resources to run the LeaderWorkerSet controller manager and all the required kube-system pods, so you'll need to use a larger
 machine type for your nodes.**
 - The kubectl command-line tool has communication with your cluster.
 
+{{% if-main %}}
+<div id="install-a-released-version"></div>
+
+## Install the development version (main branch) {#install-the-latest-development-version}
+
+{{% alert title="Development documentation" color="warning" %}}
+These commands install **unreleased builds from the main branch only**.
+For a very recent commit on `main`, the documentation may update before its Helm
+chart is published. If the chart is not yet available, retry the same command later.
+For released installations, use the [latest stable documentation](https://lws.sigs.k8s.io/stable/docs/installation/).
+{{% /alert %}}
+{{% /if-main %}}
+{{% if-release %}}
 ## Install a released version
+{{% /if-release %}}
 
 ### Install by kubectl
 
-To install a released version of LeaderWorkerSet in your cluster, run the following command:
-
+{{% if-main %}}
+```shell
+kubectl apply --server-side -k 'github.com/kubernetes-sigs/lws/config/default?ref=main'
+```
+{{% /if-main %}}
+{{% if-release %}}
 
 ```shell
-VERSION=v0.9.0
+VERSION={{< params "version" >}}
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/lws/releases/download/$VERSION/manifests.yaml
 ```
+{{% /if-release %}}
 
 To wait for LeaderWorkerSet to be fully available, run:
 
@@ -53,26 +74,34 @@ kubectl wait deploy/lws-controller-manager -n lws-system --for=condition=availab
 
 ### Install by Helm
 
+{{% if-main %}}
+To install lws from the main branch in your cluster by [Helm](https://helm.sh/), run the following command:
+{{% /if-main %}}
+{{% if-release %}}
 To install a released version of lws in your cluster by [Helm](https://helm.sh/), run the following command:
+{{% /if-release %}}
 
 ```shell
-CHART_VERSION=0.9.0
-helm install lws oci://registry.k8s.io/lws/charts/lws \
-  --version=$CHART_VERSION \
+CHART_VERSION={{< chart-version >}}
+CHART_REFERENCE={{< chart-reference >}}
+helm install lws "$CHART_REFERENCE" \
+  --version="$CHART_VERSION" \
   --namespace lws-system \
   --create-namespace \
   --wait --timeout 300s
 ```
 
+{{% if-release %}}
 You can also use the following command:
 
 ```shell
-VERSION=v0.9.0
+VERSION={{< params "version" >}}
 helm install lws https://github.com/kubernetes-sigs/lws/releases/download/$VERSION/lws-chart-$VERSION.tgz \
   --namespace lws-system \
   --create-namespace \
   --wait --timeout 300s
 ```
+{{% /if-release %}}
 
 ### Upgrade by Helm
 
@@ -85,11 +114,11 @@ so CRD schema changes and newly added CRDs do not reach the cluster through
 Apply the CRDs explicitly before upgrading, then upgrade the release in place:
 
 ```shell
-CHART_VERSION=0.9.0
-helm pull oci://registry.k8s.io/lws/charts/lws --version=$CHART_VERSION --untar
-kubectl apply --server-side --force-conflicts -f lws/crds
-helm upgrade lws oci://registry.k8s.io/lws/charts/lws \
-  --version=$CHART_VERSION \
+CHART_VERSION={{< chart-version >}}
+CHART_REFERENCE={{< chart-reference >}}
+helm pull "$CHART_REFERENCE" --version="$CHART_VERSION" --untar &&
+kubectl apply --server-side --force-conflicts -f lws/crds &&
+helm upgrade lws ./lws \
   --namespace lws-system \
   --wait --timeout 300s
 ```
@@ -124,19 +153,103 @@ Then follow the regular upgrade flow above (apply the CRDs, then
 
 ### Uninstall
 
-To uninstall a released version of LeaderWorkerSet from your cluster, run the following command:
-
+{{% if-main %}}
 ```shell
-VERSION=v0.9.0
+kubectl delete -k 'github.com/kubernetes-sigs/lws/config/default?ref=main'
+```
+{{% /if-main %}}
+{{% if-release %}}
+```shell
+VERSION={{< params "version" >}}
 kubectl delete -f https://github.com/kubernetes-sigs/lws/releases/download/$VERSION/manifests.yaml
 ```
-
-To uninstall a released version of LeaderWorkerSet from your cluster by Helm, run the following command:
+{{% /if-release %}}
 
 ```shell
 helm uninstall lws --namespace lws-system
 ```
 
+## Enable native gang scheduling
+
+Native gang scheduling is available in LWS v0.11.0 and later. It is supported
+on Kubernetes 1.37, where LWS creates the
+`scheduling.k8s.io/v1beta1` `Workload` and `PodGroup` resources introduced in
+that Kubernetes release. Earlier supported Kubernetes minors do not provide
+these API versions.
+
+The LWS integration is alpha, and its required switches are disabled by
+default in both Kubernetes and LWS. Configure the cluster and the LWS
+controller before creating a LeaderWorkerSet with `spec.scheduling`.
+
+### Configure Kubernetes
+
+Enable the `GenericWorkload` feature gate on all three control-plane
+components:
+
+- `kube-apiserver`
+- `kube-controller-manager`
+- `kube-scheduler`
+
+Also enable the scheduling API on kube-apiserver with
+`--runtime-config=scheduling.k8s.io/v1beta1=true`. How these settings are
+configured depends on your Kubernetes provider. For example, a Kind cluster
+configuration contains:
+
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  GenericWorkload: true
+runtimeConfig:
+  scheduling.k8s.io/v1beta1: true
+```
+
+### Configure LeaderWorkerSet
+
+Enable the LWS `WorkloadAwareScheduling` feature gate and select the native
+Kubernetes scheduler provider. With Helm, add these values to the install or
+upgrade command shown above:
+
+```shell
+--set featureGates.WorkloadAwareScheduling=true \
+--set gangSchedulingManagement.schedulerProvider=kubernetes
+```
+
+For a configuration-file installation, edit the `lws-manager-config`
+ConfigMap in the controller namespace and add the equivalent settings to the
+controller manager configuration:
+
+```yaml
+featureGates:
+  WorkloadAwareScheduling: true
+gangSchedulingManagement:
+  schedulerProvider: kubernetes
+```
+
+Restart the `lws-controller-manager` Deployment after changing an existing
+configuration ConfigMap:
+
+```shell
+kubectl rollout restart deployment/lws-controller-manager -n lws-system
+kubectl rollout status deployment/lws-controller-manager -n lws-system --timeout=5m
+```
+
+### Verify the prerequisites
+
+Confirm that Kubernetes serves both required APIs:
+
+```shell
+kubectl api-resources --api-group=scheduling.k8s.io | grep -E 'workloads|podgroups'
+```
+
+The output must include `workloads` and `podgroups` at version `v1beta1`.
+Then follow the [native gang scheduling quickstart](../examples/leaderworkerset/gang-scheduling/).
+
+> **Operational notes:**
+> - When `gangSchedulingManagement.schedulerProvider` is set to `kubernetes`, `lws-controller-manager` indexes and watches `scheduling.k8s.io/v1beta1` `Workload` and `PodGroup` at startup and exits if those APIs are not served (for example, if `GenericWorkload` or the `scheduling.k8s.io/v1beta1` runtime config is disabled), even for `LeaderWorkerSet` objects that do not set `spec.scheduling`. Remove the `gangSchedulingManagement` block before disabling the upstream Kubernetes APIs.
+> - Disabling `featureGates.WorkloadAwareScheduling` or removing the `gangSchedulingManagement` block rejects new `LeaderWorkerSet` objects that request `spec.scheduling`, while keeping existing opted-in objects updateable so operators can scale them down (`spec.replicas: 0`) and delete them cleanly.
+
+{{% if-release %}}
 ## Install the latest development version
 
 To install the latest development version of LeaderWorkerSet in your cluster, run the
@@ -155,6 +268,7 @@ To uninstall LeaderWorkerSet, run the following command:
 ```shell
 kubectl delete -k github.com/kubernetes-sigs/lws/config/default
 ```
+{{% /if-release %}}
 
 ## Build and install from source
 
@@ -193,7 +307,7 @@ supports cert rotation), instead of internal cert, follow the [cert manage guide
 
 ## Install with Helm chart
 
-Please refer to the release page for [helm charts][helm_charts].
+See [Install by Helm](#install-by-helm) above.
 
 ## DisaggregatedSet
 
@@ -203,19 +317,17 @@ For kubectl and Kustomize installs, the standard v0.9.0+ manifests include the D
 CRD, controller permissions, and validating webhook. No separate DisaggregatedSet installation
 step is required.
 
-For Helm installs, the DisaggregatedSet CRD and controller permissions are installed by default.
-The optional validating webhook and user-facing editor/viewer/admin ClusterRoles can be enabled
-by passing `--set enableDisaggregatedSet=true` to the Helm install command:
+Helm charts **v1.0.0 and prior** require `--set enableDisaggregatedSet=true` for the
+validating webhook and editor/viewer/admin ClusterRoles. Despite its name, this
+option never controlled the DisaggregatedSet controller or CRDs, which were
+already installed. The Helm chart now always installs these resources, matching
+the standard manifests. Follow the [Helm installation steps](#install-by-helm)
+without the extra flag.
 
-```shell
-CHART_VERSION=0.9.0
-helm install lws oci://registry.k8s.io/lws/charts/lws \
-  --version=$CHART_VERSION \
-  --namespace lws-system \
-  --create-namespace \
-  --set enableDisaggregatedSet=true \
-  --wait --timeout 300s
-```
+Old `enableDisaggregatedSet` values are now ignored, even with
+`--reuse-values`. If you previously set it to `false`, upgrading enables webhook
+validation for new or updated DisaggregatedSets. You can remove the obsolete
+option from your values files.
 
 ### Verify Installation
 
@@ -232,7 +344,7 @@ kubectl wait deploy/lws-controller-manager -n lws-system \
 kubectl get crd disaggregatedsets.disaggregatedset.x-k8s.io
 ```
 
-3. (Helm with webhooks enabled) Confirm the validating webhook configuration:
+3. Confirm the validating webhook configuration:
 
 ```shell
 kubectl get validatingwebhookconfiguration lws-validating-webhook-configuration \
@@ -241,20 +353,39 @@ kubectl get validatingwebhookconfiguration lws-validating-webhook-configuration 
 
 ### Upgrade from an older version
 
-Helm does not automatically install newly added CRDs during `helm upgrade`. If you are upgrading
-from a version older than v0.9.0, manually apply the CRD first:
+#### Migrate pre-slices DisaggregatedSets before v1.0.0
+
+DisaggregatedSet first shipped in v0.9.0, before the `slices` feature. If a
+DisaggregatedSet was originally created by v0.9.x and has not completed a rollout while
+running v0.10.x or v0.11.x, do not upgrade directly to v1.0.0. First install either
+v0.10.x or v0.11.x, then trigger and complete one template rollout for every affected
+DisaggregatedSet. For example, changing a container image in a role's pod template
+triggers a rollout.
+This replaces the generated LeaderWorkerSets and pods with objects that carry
+slice-aware names and labels. If the DisaggregatedSet has already completed such a
+rollout, no additional migration is required.
+
+Before upgrading to v1.0.0, verify that no pre-slices LeaderWorkerSets remain. The
+following command must produce no output:
 
 ```shell
-kubectl apply --server-side \
-  -f https://raw.githubusercontent.com/kubernetes-sigs/lws/main/charts/lws/crds/disaggregatedset.x-k8s.io_disaggregatedsets.yaml
-
-helm upgrade lws oci://registry.k8s.io/lws/charts/lws \
-  --namespace lws-system \
-  --set enableDisaggregatedSet=true
+kubectl get leaderworkersets -A \
+  -l 'disaggregatedset.x-k8s.io/name,!disaggregatedset.x-k8s.io/slice'
 ```
+
+`helm upgrade` does not install newly added CRDs. DisaggregatedSet ships two:
+`disaggregatedsets` since v0.9.0 and `disaggregatedsetrolescalers` since v0.10.0. Apply only
+`disaggregatedsets` and the controller cannot create the `DisaggregatedSetRoleScaler` a role with
+`scaling.mode: External` depends on, so External scaling never takes effect.
+
+Follow the [Upgrade by Helm](#upgrade-by-helm) steps to apply all CRDs before
+upgrading the chart. The **chart version you are upgrading to** determines the flag:
+
+- **The chart documented here:** omit `--set enableDisaggregatedSet=true`; the webhook and
+  user-facing ClusterRoles are always installed, ignoring any saved flag value.
+- **v1.0.0 and prior:** add `--set enableDisaggregatedSet=true` to install those resources.
 
 [feature_gate]: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 [start_ordinal]: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#start-ordinal
 [max_unavailable]: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#maximum-unavailable-pods
 [max_unavailable_enhancement]: https://github.com/kubernetes/enhancements/issues/961
-[helm_charts]: https://github.com/kubernetes-sigs/lws/releases

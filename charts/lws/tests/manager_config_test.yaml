@@ -1,0 +1,89 @@
+suite: controller manager configuration
+templates:
+  - templates/manager/configmap.yaml
+release:
+  name: lws
+  namespace: lws-system
+tests:
+  - it: renders only the base configuration by default
+    asserts:
+      - equal:
+          path: data["controller_manager_config.yaml"]
+          value: |
+            apiVersion: config.lws.x-k8s.io/v1
+            kind: Configuration
+            leaderElection:
+              leaderElect: true
+            webhook:
+              port: 9443
+            internalCertManagement:
+              enable: true
+
+  - it: keeps default leader election timing when the configuration is absent
+    set:
+      leaderElection: null
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^leaderElection:\\n  leaderElect: true\\nwebhook:$"
+
+  - it: listens for webhooks on the configured service port
+    set:
+      service:
+        port: 10443
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^webhook:\\n  port: 10443$"
+
+  - it: enables internal certificate management without cert-manager
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^internalCertManagement:\\n  enable: true$"
+
+  - it: disables internal certificate management with cert-manager
+    set:
+      enableCertManager: true
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^internalCertManagement:\\n  enable: false$"
+
+  - it: renders leader election timing when set
+    set:
+      leaderElection:
+        leaseDuration: 60s
+        renewDeadline: 30s
+        retryPeriod: 6s
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^leaderElection:\\n  leaderElect: true\\n  leaseDuration: 60s\\n  renewDeadline: 30s\\n  retryPeriod: 6s\\nwebhook:$"
+
+  - it: ignores leader election keys other than timing
+    set:
+      leaderElection:
+        leaderElect: false
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^leaderElection:\\n  leaderElect: true\\nwebhook:$"
+
+  - it: renders feature gates when set
+    set:
+      featureGates:
+        WorkloadAwareScheduling: true
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^featureGates:\\n  WorkloadAwareScheduling: true$"
+
+  - it: configures Volcano gang scheduling
+    set:
+      gangSchedulingManagement:
+        schedulerProvider: volcano
+    asserts:
+      - matchRegex:
+          path: data["controller_manager_config.yaml"]
+          pattern: "(?m)^gangSchedulingManagement:\\n  schedulerProvider: volcano$"

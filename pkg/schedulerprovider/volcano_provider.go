@@ -18,6 +18,7 @@ package schedulerprovider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,56 +47,135 @@ func NewVolcanoProvider(client client.Client) *VolcanoProvider {
 	}
 }
 
+// ReconcileScheduling validates spec.scheduling for Volcano. Replica PodGroups
+// are materialized per leader pod via CreatePodGroupIfNotExists before the
+// leader pod's scheduling gate is lifted.
+func (v *VolcanoProvider) ReconcileScheduling(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, replicas int32, revision string) error {
+	if lws.Spec.Scheduling == nil {
+		return nil
+	}
+	mode, err := SchedulingModeFor(lws)
+	if err != nil {
+		return NewReconcileError(ReasonInvalidSchedulingConfiguration, err)
+	}
+	if mode != SchedulingModeReplica {
+		return NewReconcileError(ReasonUnsupportedProviderCapability, fmt.Errorf("the Volcano provider supports the typed API only at replica level"))
+	}
+	if config := lws.Spec.Scheduling.Replica; config != nil {
+		if (config.SchedulingPolicy != nil && config.SchedulingPolicy.Basic != nil) || config.SchedulingConstraints != nil || config.DisruptionMode != nil {
+			return NewReconcileError(ReasonUnsupportedProviderCapability, fmt.Errorf("the Volcano provider supports only replica gang policy in the typed API"))
+		}
+	}
+	return nil
+}
+
 func (v *VolcanoProvider) CreatePodGroupIfNotExists(ctx context.Context, lws *leaderworkerset.LeaderWorkerSet, leaderPod *corev1.Pod) error {
 	var pg volcanov1beta1.PodGroup
 	pgName := leaderPod.Annotations[volcanov1beta1.KubeGroupNameAnnotationKey]
+	if pgName == "" {
+		if lws.Spec.Scheduling != nil ||
+			leaderPod.Spec.SchedulerName == string(Volcano) ||
+			lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.SchedulerName == string(Volcano) {
+			return fmt.Errorf("pod %s/%s is missing annotation %q required for Volcano gang scheduling", leaderPod.Namespace, leaderPod.Name, volcanov1beta1.KubeGroupNameAnnotationKey)
+		}
+		// Pods created before the provider was enabled did not receive the
+		// annotation from the CREATE webhook. Leave those groups on their
+		// existing scheduler without adding a PodGroup.
+		return nil
+	}
 	log := ctrl.LoggerFrom(ctx).WithValues("podGroup", pgName, "namespace", lws.Namespace)
 
-	if err := v.client.Get(ctx, types.NamespacedName{Name: pgName, Namespace: lws.Namespace}, &pg); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-		minResources := utils.CalculatePGMinResources(lws)
-		pg = volcanov1beta1.PodGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      pgName,
-				Namespace: lws.Namespace,
-				Labels: map[string]string{
-					leaderworkerset.SetNameLabelKey:    lws.Name,
-					leaderworkerset.GroupIndexLabelKey: leaderPod.Labels[leaderworkerset.GroupIndexLabelKey],
-					leaderworkerset.RevisionKey:        leaderPod.Labels[leaderworkerset.RevisionKey],
-				},
-				Annotations: inheritVolcanoAnnotations(lws),
-			},
-			Spec: volcanov1beta1.PodGroupSpec{
-				// Default startupPolicy is LeaderCreated, Leader and Workers Pods are scheduled together, so MinAvailable is set to size
-				MinMember:    *lws.Spec.LeaderWorkerTemplate.Size,
-				MinResources: &minResources,
-			},
+	// With spec.scheduling, Ordinal PodGroups are owned by the LWS since an
+	// ordinal reuses its name across restarts. Hash groups never reuse a name,
+	// so the leader owns them and they are garbage collected with it.
+	ownedByLWS := lws.Spec.Scheduling != nil && lws.Spec.GroupIdentity != leaderworkerset.GroupIdentityHash
+
+	if err := v.client.Get(ctx, types.NamespacedName{Name: pgName, Namespace: lws.Namespace}, &pg); err == nil {
+		if pg.DeletionTimestamp != nil {
+			return fmt.Errorf("waiting for podgroup %s/%s to finish deletion", pg.Namespace, pgName)
 		}
 
-		// If the StartUpPolicy of lws is LeaderReady, set MinMember to 1 to allow the Leader Pod to be scheduled.
-		// However, minResources should still be set to the minResources of the PodGroup (1 Leader + (size-1) Workers).
-		// If the cluster resources are insufficient, scheduling the Leader Pod alone would be meaningless,
-		// as at least one Worker will definitely not be able to be scheduled.
-		if lws.Spec.StartupPolicy == leaderworkerset.LeaderReadyStartupPolicy {
-			pg.Spec.MinMember = 1
+		owner := metav1.GetControllerOf(&pg)
+		if ownedByLWS {
+			if owner == nil ||
+				owner.APIVersion != leaderworkerset.GroupVersion.String() ||
+				owner.Kind != "LeaderWorkerSet" ||
+				owner.Name != lws.Name {
+				return fmt.Errorf("%w: podgroup %s/%s has controller owner %+v; expected LeaderWorkerSet %s with UID %s", ErrUnexpectedPodGroupOwner, pg.Namespace, pgName, owner, lws.Name, lws.UID)
+			}
+			if owner.UID == lws.UID {
+				return nil
+			}
+			return fmt.Errorf("waiting for podgroup %s/%s owned by previous LeaderWorkerSet UID %s to be deleted; current LeaderWorkerSet UID is %s", pg.Namespace, pgName, owner.UID, lws.UID)
+		}
+		// Earlier releases made hash PodGroups LWS-owned.
+		if lws.Spec.GroupIdentity == leaderworkerset.GroupIdentityHash && owner != nil && owner.Kind == "LeaderWorkerSet" && owner.UID == lws.UID {
+			return nil
 		}
 
-		if queueName, ok := lws.Annotations[volcanov1beta1.QueueNameAnnotationKey]; ok {
-			pg.Spec.Queue = queueName
+		// LWS-created PodGroups are always controlled by their leader Pod in legacy annotation mode. This should not happen during
+		// normal reconciliation, so fail without modifying a same-name PodGroup with an unexpected owner.
+		if owner == nil ||
+			owner.APIVersion != corev1.SchemeGroupVersion.String() ||
+			owner.Kind != "Pod" ||
+			owner.Name != leaderPod.Name {
+			return fmt.Errorf("%w: podgroup %s/%s has controller owner %+v; expected v1 Pod %s with UID %s", ErrUnexpectedPodGroupOwner, pg.Namespace, pgName, owner, leaderPod.Name, leaderPod.UID)
+		}
+		if owner.UID == leaderPod.UID {
+			return nil
 		}
 
-		err = ctrl.SetControllerReference(leaderPod, &pg, v.client.Scheme())
-		if err != nil {
-			return err
-		}
-
-		if err = v.client.Create(ctx, &pg); err != nil {
-			return err
-		}
-		log.V(2).Info("Created PodGroup for LeaderWorkerSet")
+		// The stale PodGroup is owned by the previous leader Pod. Wait for owner-reference garbage collection
+		// to delete it, then create a PodGroup owned by the current leader Pod on a subsequent reconciliation.
+		return fmt.Errorf("waiting for podgroup %s/%s owned by previous leader UID %s to be deleted; current leader UID is %s", pg.Namespace, pgName, owner.UID, leaderPod.UID)
+	} else if client.IgnoreNotFound(err) != nil {
+		return err
 	}
+
+	minResources := utils.CalculatePGMinResources(lws)
+	pg = volcanov1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pgName,
+			Namespace: lws.Namespace,
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:    lws.Name,
+				leaderworkerset.GroupIndexLabelKey: leaderPod.Labels[leaderworkerset.GroupIndexLabelKey],
+				leaderworkerset.RevisionKey:        leaderPod.Labels[leaderworkerset.RevisionKey],
+			},
+			Annotations: inheritVolcanoAnnotations(lws),
+		},
+		Spec: volcanov1beta1.PodGroupSpec{
+			// Default startupPolicy is LeaderCreated, Leader and Workers Pods are scheduled together, so MinAvailable is set to size
+			MinMember:    *lws.Spec.LeaderWorkerTemplate.Size,
+			MinResources: &minResources,
+		},
+	}
+
+	// If the StartUpPolicy of lws is LeaderReady, set MinMember to 1 to allow the Leader Pod to be scheduled.
+	// However, minResources should still be set to the minResources of the PodGroup (1 Leader + (size-1) Workers).
+	// If the cluster resources are insufficient, scheduling the Leader Pod alone would be meaningless,
+	// as at least one Worker will definitely not be able to be scheduled.
+	if lws.Spec.StartupPolicy == leaderworkerset.LeaderReadyStartupPolicy {
+		pg.Spec.MinMember = 1
+	}
+
+	if queueName, ok := lws.Annotations[volcanov1beta1.QueueNameAnnotationKey]; ok {
+		pg.Spec.Queue = queueName
+	}
+
+	var controllerOwner metav1.Object = leaderPod
+	if ownedByLWS {
+		controllerOwner = lws
+	}
+	err := ctrl.SetControllerReference(controllerOwner, &pg, v.client.Scheme())
+	if err != nil {
+		return err
+	}
+
+	if err = v.client.Create(ctx, &pg); err != nil {
+		return err
+	}
+	log.V(2).Info("Created PodGroup for LeaderWorkerSet")
 
 	return nil
 }

@@ -28,17 +28,7 @@ these multi-role, multi-resource serving patterns with a single, declarative Kub
 DisaggregatedSet does **not** replace LeaderWorkerSet — it **orchestrates multiple LeaderWorkerSets**.
 
 Each `role` defined in a `DisaggregatedSet` spec maps to an independent `LeaderWorkerSet`, deployed
-in the same namespace. This means:
-
-| Feature | LeaderWorkerSet (LWS) | DisaggregatedSet |
-|---|---|---|
-| Unit | A single group of homogeneous pods | Multiple groups, each with a distinct role |
-| Use case | Uniform inference or training | Disaggregated prefill/decode/encode serving |
-| CRD version | `leaderworkerset.x-k8s.io/v1` | `disaggregatedset.x-k8s.io/v1` |
-| Controller namespace | `lws-system` | `lws-system` |
-| Dependency | None | None (bundled in LWS from v0.9.0) |
-
-Child LeaderWorkerSets use a **slice index** and a **revision hash** in their names:
+in the same namespace. Child LeaderWorkerSets use a **slice index** and a **revision hash** in their names:
 
 ```
 DisaggregatedSet "my-inference"
@@ -56,52 +46,79 @@ Each child LWS inherits standard LWS capabilities such as subgroup policies,
 exclusive placement, volume claim templates, and health monitoring. Rollout
 strategy for the set is owned by the DisaggregatedSet controller (see below).
 
-## Roles in DisaggregatedSet
-
-A `DisaggregatedSet` spec contains a `roles` list. Each role defines:
-
-| Field | Description |
-|---|---|
-| `name` | Unique name for this role (e.g., `prefill`, `decode`) |
-| `replicas` | Number of LWS replicas (pod groups) for this role (per slice) |
-| `rolloutStrategy` | Rolling update config for this role (DisaggregatedSet coordinates rollouts across roles; `partition`-based rollout is not supported) |
-| `leaderWorkerTemplate` | Pod template defining leader + worker containers |
-| `scaling` | Optional external scaling mode (for example HPA via `DisaggregatedSetRoleScaler`) |
-
-DisaggregatedSet coordinates lifecycle and rollouts across roles. Each role's replica count,
-rollout strategy, and pod template can be configured independently, while the controller manages
-them as a single cohesive unit.
-
-Optional top-level fields such as `slices` (replicate the full role topology) and
-`placementPolicy` (topology co-location / spread) are covered in the
-[examples and operations guide](/docs/examples/disaggregatedset/).
-
-## When to Use DisaggregatedSet vs Plain LWS
-
-Use **plain LWS** when:
-- All inference pods are homogeneous (same model, same resources).
-- You do not need to separate prefill from decode.
-- You are running training jobs or batch workloads without disaggregation.
-
-Use **DisaggregatedSet** when:
-- You are running disaggregated LLM inference (e.g., vLLM with P/D disaggregation, SGLang).
-- Different inference phases require different GPU types or different pod group sizes.
-- You want to scale prefill and decode replicas independently based on different traffic patterns.
-- You are evaluating disaggregated serving architectures and need first-class Kubernetes support.
-
 ## Key Design Principles
 
 1. **LWS-native** — DisaggregatedSet is built on top of LWS, not alongside it. This means LWS features (failure handling, subgroup topology, exclusive placement) are available per role. Note: rollout strategy is owned by the DisaggregatedSet controller, which replaces the per-LWS rollout to coordinate updates across roles.
 
-2. **Coordinated rollouts** — Rollouts across roles are coordinated by DisaggregatedSet to preserve capacity ratios (e.g., prefill-to-decode ratio) throughout the update process. Partition-based rollout is not supported.
+2. **Coordinated rollouts** — Rollouts across roles are coordinated by DisaggregatedSet to preserve capacity ratios (e.g., prefill-to-decode ratio) throughout the update process. Each role's `rolloutStrategy.rollingUpdateConfiguration` sets its `maxSurge` and `maxUnavailable`, defaulting to `maxSurge: 0, maxUnavailable: 1` like a LeaderWorkerSet, so a rollout needs no capacity beyond the role's replicas. Set `maxSurge: 1, maxUnavailable: 0` on a role to bring the new revision up before the old one drains. Partition-based rollout is not supported.
 
 3. **Declarative** — The entire multi-role inference topology is expressed in a single YAML manifest, making it easy to version-control and apply via GitOps.
 
-## Further Reading
+## Rollout availability
 
-- [KEP-766: DisaggregatedSet design document](https://github.com/kubernetes-sigs/lws/tree/main/keps/766-DisaggregatedSet)
-- [Installation guide](/docs/installation/#disaggregatedset)
-- [API Reference](/docs/reference/disaggregatedset.v1/)
-- [Labels and annotations](/docs/reference/labels-annotations-and-environment-variables/)
-- [Examples and operations](/docs/examples/disaggregatedset/)
-- In-repo samples: [`config/samples/disaggregatedset_v1_disaggregatedset.yaml`](https://github.com/kubernetes-sigs/lws/blob/main/config/samples/disaggregatedset_v1_disaggregatedset.yaml), [`config/samples/disaggregatedset_v1_3role.yaml`](https://github.com/kubernetes-sigs/lws/blob/main/config/samples/disaggregatedset_v1_3role.yaml)
+For a visual introduction to coordinated updates, see [Rollout Strategy](rollout-strategy/).
+It explains the fractional coordination window and how it works alongside each role's `maxSurge` and `maxUnavailable`.
+
+For routing requests while old and new revisions coexist, see [Revision Gating (with llm-d)](llm-d-integration/).
+
+Each role's `maxUnavailable` limits how many of its groups can be unavailable.
+For fixed replica targets, its availability floor is
+`max(0, replicas - maxUnavailable)`. If a required role still present in the target
+has a floor of zero, the controller may remove its last old group without
+waiting for every role in that old revision to retire together. Other roles
+retain their own Ready-group floors, even while the old revision is incomplete.
+
+This can interrupt service: a revision needs a Ready group in every required
+role to serve traffic. For example, explicitly setting `maxUnavailable: 1`
+permits a singleton Prefill role to be entirely unavailable, just like `100%`.
+A fixed `1 Prefill / 2 Decode` update with explicit `maxSurge: 0` and
+`maxUnavailable: 1` on both roles can drain old `1P/2D` to `0P/1D`, start new `1P/1D`,
+then replace the remaining old Decode once the new Decode is Ready. Three
+equal-size group slots suffice. The old Decode continues to count against its
+own budget after Prefill is removed.
+
+When every required current role has a positive floor, the controller also
+preserves complete-revision serving capacity. A merely unhealthy peer does not
+waive that protection. Keeping a singleton role continuously available requires
+`maxUnavailable: 0` and a positive `maxSurge`, and can require spare capacity.
+Bootstrap recovery can also require an extra group; scheduler rejection never
+automatically lowers a positive availability floor to zero.
+
+## Scaling during a rollout
+
+For a scale-up example and an animated scale-down comparison, see [Scaling During a Rollout](scaling-during-rollout/).
+
+This applies to static `roles[].spec.replicas` and External [RoleScaler](role-scaler) targets. Changing replicas or the scaling policy does not create a new revision.
+
+| Setting under `scalingPolicy` | `Deferred` (default) | `Immediate` |
+| --- | --- | --- |
+| `scaleUpDuringRollout` | Grows the target through normal rollout batches. | Also fills the desired count minus replicas still requested in all old revisions, without waiting for the current batch to become Ready. |
+| `scaleDownDuringRollout` | Defers shrinking already-created target replicas until old revisions drain. Old replicas can still retire. | Tries to remove excess old replicas first. If they must remain to serve traffic, it can shrink excess target replicas instead. |
+
+To enable both Immediate behaviors:
+
+```yaml
+spec:
+  scalingPolicy:
+    scaleUpDuringRollout: Immediate
+    scaleDownDuringRollout: Immediate
+```
+
+The fields are independent; omitting either preserves its `Deferred` behavior. Immediate scale-up fills requested capacity, not a readiness shortfall: loading groups already count, and losing readiness alone does not create another batch. It does not increase `maxSurge`, permit extra old reductions, or bypass renamed-role replacement safeguards. Immediate scale-down considers reductions now, but availability and startup safeguards can delay them.
+
+For roles still required by the target, both old and target reductions protect `effective desired - maxUnavailable` Ready groups, with a minimum of zero. The effective count normally follows the latest request; under `scaleDownDuringRollout: Deferred`, an External role with overlapping old replicas keeps at least the already-created target count. Requesting more capacity raises this floor. If fewer groups are currently Ready, the controller preserves those groups while growing the target; a smaller old revision is not permission to reduce availability further.
+
+If ordinary scale-up becomes blocked by coordination, the existing recovery rules can use one temporary extra group per eligible role. That role's existing target groups must all be Ready and its total Spec must be at its surge ceiling. The extra cannot stack while the role remains over its ceiling or waits for readiness. This does not enable `scaleDownDuringRollout: Deferred` to shrink the target in response to a lower replica request.
+
+With `scaleDownDuringRollout: Immediate`, when the target revision has more replicas than its latest desired count, both Ordinal and Hash follow the same rule for each role:
+
+- If any target Pod is assigned to a node, even if it is still loading, keep at least the final desired count. The same protection applies when scheduling information is incomplete.
+- If every target group is confirmed unscheduled, the count may go below desired toward `desired + maxSurge - old replicas`. Availability checks and the first group of each required role still limit that reduction. This does not shrink a target already at or below desired.
+
+For example, per role: old Spec/Ready 4, target Spec 5 with none Ready, desired 4, `maxSurge: 1`, and `maxUnavailable: 0`. A scheduled target can reduce to 4; an entirely unscheduled target can reduce to 1. The first case keeps 8 total groups above the latest ceiling of 5 until new readiness permits old groups to drain, potentially for a long time if startup stalls.
+
+This protects the replica count, not particular Pods. It can keep some unscheduled groups alongside scheduled ones; removing excess above desired can still delete scheduled work, and placement may change before deletion.
+
+Renamed-role rollouts can start a bounded next batch using Ready replacements without waiting for another old group to leave; if a target role later loses all Ready groups, recovery under either scale-down policy may reclaim extra groups, even Ready ones, while preserving the last Ready group per role and protected old capacity. With `scaleDownDuringRollout: Immediate`, completion requires old replicas to be gone and target Spec and Ready to equal the latest desired count, including zero.
+
+See [KEP-1022](https://github.com/kubernetes-sigs/lws/tree/main/keps/1022-DisaggregatedSet-Scaling-During-Rollout) for the exact budgets, renamed-role availability, and recovery rules.

@@ -43,8 +43,8 @@ Alternatively, you can use the charts available at `oci://registry.k8s.io/lws/ch
 
 ```bash
 kubectl get deploy -n lws-system
-NAME                          READY   UP-TO-DATE   AVAILABLE   AGE
-lws-system-controller-manager   1/1     1            1           14s
+NAME                     READY   UP-TO-DATE   AVAILABLE   AGE
+lws-controller-manager   1/1     1            1           14s
 ```
 
 ##### Cert Manager
@@ -64,10 +64,20 @@ for more information on installing LWS with metrics using our Helm chart.
 
 ##### DisaggregatedSet
 
-The DisaggregatedSet CRD and the manager permissions required by its bundled
-controller are always installed with the chart. To also install the
-editor/viewer/admin ClusterRoles and validating webhook, set
-`enableDisaggregatedSet` to `true`.
+The DisaggregatedSet CRDs and controller permissions are always installed.
+Helm charts **v1.0.0 and prior** require
+`--set enableDisaggregatedSet=true` to also install the validating webhook and
+editor/viewer/admin ClusterRoles.
+
+Despite its name, `enableDisaggregatedSet` only controlled the validating webhook
+and user-facing ClusterRoles. The DisaggregatedSet controller and CRDs were already installed.
+The chart now always installs these resources, matching the standard manifests.
+No extra flag is needed.
+
+Old `enableDisaggregatedSet` values are now ignored, even with
+`--reuse-values`. If you previously set it to `false`, upgrading enables webhook
+validation for new or updated DisaggregatedSets. You can remove the obsolete
+option from your values files.
 
 ### Upgrading the chart
 
@@ -88,11 +98,12 @@ the new chart version expects. `--server-side` lets the apply coexist with the
 ownership Helm records for the resource:
 
 ```bash
-kubectl apply --server-side --force-conflicts \
-  -f charts/lws/crds/leaderworkerset.x-k8s.io_leaderworkersets.yaml \
-  -f charts/lws/crds/disaggregatedset.x-k8s.io_disaggregatedsets.yaml
+kubectl apply --server-side --force-conflicts -f charts/lws/crds
 helm upgrade lws charts/lws --namespace lws-system
 ```
+
+The directory form also picks up CRDs added later, such as
+`disaggregatedsetrolescalers` in v0.10.0, which backs `scaling.mode: External`.
 
 > **Note**: neither `helm upgrade` nor `helm uninstall` + `helm install` will
 > update CRD schemas — Helm never modifies CRDs placed in the `crds/` directory
@@ -130,21 +141,44 @@ The following table lists the configurable parameters of the LWS chart and their
 | `nameOverride`                             | nameOverride                                   | ``                                                  |
 | `fullnameOverride`                         | fullnameOverride                               | ``                                                  |
 | `enablePrometheus`                         | enable Prometheus                              | `false`                                             |
+| `serviceMonitor.extraLabels`               | Extra labels added to the ServiceMonitor (requires `enablePrometheus=true`) | `{}`                                                |
 | `enableCertManager`                        | enable CertManager                             | `false`                                             |
-| `enableDisaggregatedSet`                   | install DisaggregatedSet editor/viewer/admin ClusterRoles and validating webhook (the CRD, bundled controller, and its required RBAC rules are always installed) | `false` |
+| `replicaCount`                             | Number of manager replicas (leader election keeps one active) | `1`                                  |
+| `serviceAccount.name`                      | Name of the manager ServiceAccount; `<fullname>-controller-manager` when empty | `""`               |
+| `pdb.enabled`                              | Create a PodDisruptionBudget for the manager (only when `replicaCount` > 1) | `true`                 |
+| `pdb.minAvailable`                         | Minimum manager pods available after eviction  | `1`                                                 |
+| `pdb.maxUnavailable`                       | Maximum manager pods unavailable; takes precedence over `minAvailable` | `null`                      |
+| `pdb.unhealthyPodEvictionPolicy`           | Eviction policy for manager pods that are not Ready (`AlwaysAllow` or `IfHealthyBudget`); omitted when `null` | `AlwaysAllow` |
 | `imagePullSecrets`                         | Image pull secrets                             | `[]`                                                |
-| `image.manager.repository`                 | Repository for manager image                   | `us-central1-docker.pkg.dev/k8s-staging-images/lws` |
+| `image.manager.repository`                 | Repository for manager image                   | `registry.k8s.io/lws/lws`                           |
 | `image.manager.tag`                        | Tag for manager image                          | `main`                                              |
-| `image.manager.pullPolicy`                 | Pull policy for manager image                  | `IfNotPresent`                                      |
+| `image.manager.digest`                     | Digest for manager image (e.g. `sha256:...`); takes precedence over `tag` | `""`                     |
+| `image.manager.pullPolicy`                 | Pull policy for manager image                  | `Always`                                            |
 | `podAnnotations`                           | Annotations for pods                           | `{}`                                                |
 | `podSecurityContext.runAsNonRoot`          | Run pod as non-root user                       | `true`                                              |
 | `securityContext.allowPrivilegeEscalation` | Allow privilege escalation in security context | `false`                                             |
+| `securityContext.readOnlyRootFilesystem`   | Mount the container root filesystem read-only  | `true`                                              |
 | `securityContext.capabilities.drop`        | Drop all capabilities in security context      | `["ALL"]`                                           |
 | `service.type`                             | Type of lws controller service                 | `ClusterIP`                                         |
-| `service.port`                             | Lws controller service port                    | `9443`                                              |
+| `service.port`                             | Webhook server target port                     | `9443`                                              |
 | `resources.requests.cpu`                   | CPU request for resources                      | `1`                                                 |
 | `resources.requests.memory`                | Memory request for resources                   | `1Gi`                                               |
+| `priorityClassName`                        | PriorityClass for the manager pods             | `""`                                                |
 | `nodeSelector`                             | Node selector                                  | `{}`                                                |
-| `tolerations`                              | Tolerations                                    | `{}`                                                |
+| `tolerations`                              | Tolerations                                    | `[]`                                                |
 | `affinity`                                 | Affinity                                       | `{}`                                                |
 | `gangSchedulingManagement`                 | Configuration for gang scheduling.             | `{}`                                                |
+| `computeDomainManagement.enabled`          | Grant RBAC permissions for NVIDIA DRA `ComputeDomain` (`computedomains.resource.nvidia.com`) | `false` |
+| `featureGates`                             | Alpha LWS feature gates, e.g. `{WorkloadAwareScheduling: true, AutoComputeDomain: true}` | `{}`          |
+| `leaderElection`                           | Manager lease timing (`leaseDuration`, `renewDeadline`, `retryPeriod`); controller defaults when empty | `{}` |
+
+To enable the Volcano provider, set `gangSchedulingManagement.schedulerProvider=volcano`.
+Existing pods without `scheduling.k8s.io/group-name` keep using their current
+scheduler without a Volcano PodGroup, unless the leader or workers use
+`schedulerName: volcano` or their LWS sets `spec.scheduling`. LWS does not add
+the annotation to existing pods. Pods that require Volcano gang scheduling
+must have the annotation; otherwise reconciliation reports an error.
+
+The provider still adds the annotation to newly created LWS pods, including
+those using other schedulers. New replicas and replacement leaders therefore
+get PodGroups through the usual creation path.

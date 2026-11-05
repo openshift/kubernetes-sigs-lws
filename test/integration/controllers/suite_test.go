@@ -27,6 +27,8 @@ import (
 	"github.com/onsi/gomega"
 	. "github.com/onsi/gomega"
 
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -36,8 +38,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
+	disaggregatedsetv1 "sigs.k8s.io/lws/api/disaggregatedset/v1"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/computedomain"
 	"sigs.k8s.io/lws/pkg/controllers"
+	disaggregatedsetcontroller "sigs.k8s.io/lws/pkg/controllers/disaggregatedset"
+	"sigs.k8s.io/lws/pkg/features"
+	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -45,9 +52,10 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	cfg       *rest.Config
-	k8sClient client.Client
-	testEnv   *envtest.Environment
+	cfg        *rest.Config
+	k8sClient  client.Client
+	k8sManager ctrl.Manager
+	testEnv    *envtest.Environment
 	// These global context vars used to pass ctx cancel func to AfterSuite as
 	// a workaround for https://github.com/kubernetes-sigs/controller-runtime/issues/1571
 	ctx           context.Context
@@ -67,6 +75,12 @@ var _ = BeforeSuite(func() {
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
+		ControlPlane: envtest.ControlPlane{
+			APIServer: &envtest.APIServer{Args: []string{
+				"--feature-gates=GenericWorkload=true",
+				"--runtime-config=scheduling.k8s.io/v1beta1=true",
+			}},
+		},
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "..", "config", "crd", "bases"),
 			filepath.Join("..", "..", "..", "test", "integration", "crd"),
@@ -79,7 +93,7 @@ var _ = BeforeSuite(func() {
 		// Note that you must have the required binaries setup under the bin directory to perform
 		// the tests directly. When we run make test it will be setup and used automatically.
 		BinaryAssetsDirectory: filepath.Join("..", "..", "..", "bin", "k8s",
-			fmt.Sprintf("1.28.3-%s-%s", runtime.GOOS, runtime.GOARCH)),
+			fmt.Sprintf("1.37.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
 	}
 
 	var err error
@@ -90,8 +104,14 @@ var _ = BeforeSuite(func() {
 
 	err = leaderworkerset.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	err = disaggregatedsetv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+	err = computedomain.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 
 	err = volcanov1beta1.AddToScheme(scheme.Scheme)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	err = schedulingv1beta1.AddToScheme(scheme.Scheme)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	//+kubebuilder:scaffold:scheme
@@ -99,21 +119,46 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
-	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme: scheme.Scheme,
-	})
+	}
+	Expect(controllers.ConfigureCacheOptions(&mgrOpts.Cache)).To(Succeed())
+	k8sManager, err = ctrl.NewManager(cfg, mgrOpts)
 	Expect(err).ToNot(HaveOccurred())
 
-	lwsController := controllers.NewLeaderWorkerSetReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("leaderworkerset"))
+	// Register AutoComputeDomain watches and field index in the shared manager,
+	// then restore the default (false) so existing suites run with the gate off
+	// while AutoComputeDomain specs flip it on via SetFeatureGateDuringTest.
+	Expect(utilfeature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{
+		string(features.AutoComputeDomain): true,
+	})).To(Succeed())
+
+	kubernetesProvider := schedulerprovider.NewKubernetesProvider(k8sManager.GetClient())
+	lwsController := controllers.NewLeaderWorkerSetReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("leaderworkerset"), kubernetesProvider)
 
 	err = controllers.SetupIndexes(k8sManager.GetFieldIndexer())
+	Expect(err).ToNot(HaveOccurred())
+	err = schedulerprovider.SetupKubernetesIndexes(k8sManager.GetFieldIndexer())
+	Expect(err).ToNot(HaveOccurred())
+	err = computedomain.SetupIndexes(k8sManager.GetFieldIndexer())
 	Expect(err).ToNot(HaveOccurred())
 	err = lwsController.SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
-	podController = controllers.NewPodReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("pod"), nil)
+	dsController := disaggregatedsetcontroller.NewDisaggregatedSetReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("disaggregatedset"))
+	err = dsController.SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = computedomain.NewReconciler(k8sManager.GetClient()).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	podController = controllers.NewPodReconciler(k8sManager.GetClient(), k8sManager.GetScheme(), k8sManager.GetEventRecorder("pod"), kubernetesProvider)
 	err = podController.SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
+
+	Expect(utilfeature.DefaultMutableFeatureGate.SetFromMap(map[string]bool{
+		string(features.AutoComputeDomain): false,
+	})).To(Succeed())
 
 	go func() {
 		defer GinkgoRecover()

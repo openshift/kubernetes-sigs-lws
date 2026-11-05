@@ -9,9 +9,13 @@ namespace: lws-system
 namePrefix: lws-
 
 # Common labels to add to all resources and selectors (matches Helm behavior).
-commonLabels:
-  app.kubernetes.io/name: lws
-  app.kubernetes.io/instance: lws
+# includeSelectors is required to preserve the selector injection that the
+# deprecated commonLabels field performed implicitly.
+labels:
+- includeSelectors: true
+  pairs:
+    app.kubernetes.io/name: lws
+    app.kubernetes.io/instance: lws
 
 resources:
 - ../crd
@@ -31,6 +35,9 @@ resources:
 # [VOLCANO] To enable Volcano gang scheduling RBAC, uncomment the following.
 # components:
 # - ../components/volcano
+# [COMPUTEDOMAIN] To enable NVIDIA DRA ComputeDomain RBAC, uncomment the following.
+# components:
+# - ../components/computedomain
 
 patches:
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in

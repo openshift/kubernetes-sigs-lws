@@ -24,7 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 
-	configapi "sigs.k8s.io/lws/api/config/v1alpha1"
+	configapi "sigs.k8s.io/lws/api/config/v1"
 )
 
 func TestValidate(t *testing.T) {
@@ -106,6 +106,29 @@ func TestValidate(t *testing.T) {
 				GangSchedulingManagement: &configapi.GangSchedulingManagement{
 					SchedulerProvider: ptr.To("volcano"),
 				},
+			},
+		},
+		"kubernetes schedulerProvider": {
+			cfg: &configapi.Configuration{
+				GangSchedulingManagement: &configapi.GangSchedulingManagement{
+					SchedulerProvider: ptr.To("kubernetes"),
+				},
+			},
+		},
+		"unknown feature gate": {
+			cfg: &configapi.Configuration{
+				FeatureGates: map[string]bool{"UnknownGate": true},
+			},
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeNotSupported,
+					Field: "featureGates",
+				},
+			},
+		},
+		"known feature gate": {
+			cfg: &configapi.Configuration{
+				FeatureGates: map[string]bool{"WorkloadAwareScheduling": true},
 			},
 		},
 	}

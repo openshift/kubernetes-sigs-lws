@@ -1,3 +1,4 @@
+{{- $managerConfig := include (print $.Template.BasePath "/manager/configmap.yaml") . | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,11 +17,13 @@ spec:
       {{- include "lws.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
         kubectl.kubernetes.io/default-container: manager
+        # Restart on config changes, not ConfigMap metadata changes.
+        checksum/manager-config: {{ index $managerConfig.data "controller_manager_config.yaml" | sha256sum | quote }}
+        {{- with omit (.Values.podAnnotations | default dict) "checksum/manager-config" }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         control-plane: controller-manager
         {{- include "lws.selectorLabels" . | nindent 8 }}
@@ -32,7 +35,7 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      serviceAccountName: {{ include "lws.fullname" . }}-controller-manager
+      serviceAccountName: {{ include "lws.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: 10
@@ -45,7 +48,7 @@ spec:
           name: manager
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.manager.repository }}:{{ .Values.image.manager.tag | default .Chart.AppVersion }}"
+          image: {{ include "lws.image" . | quote }}
           imagePullPolicy: {{ .Values.image.manager.pullPolicy }}
           ports:
             - name: webhook-server
