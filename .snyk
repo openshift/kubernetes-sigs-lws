@@ -10,3 +10,4 @@ exclude:
     - pkg/utils/utils.go
     - site/**
     - hack/**
+    - test/**
