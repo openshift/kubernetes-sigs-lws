@@ -56,6 +56,7 @@ import (
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/lws/pkg/computedomain"
 	"sigs.k8s.io/lws/pkg/features"
+	"sigs.k8s.io/lws/pkg/metrics"
 	"sigs.k8s.io/lws/pkg/schedulerprovider"
 	"sigs.k8s.io/lws/pkg/utils"
 	controllerutils "sigs.k8s.io/lws/pkg/utils/controller"
@@ -158,8 +159,15 @@ func (r *LeaderWorkerSetReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Get leaderworkerset object
 	lws := &leaderworkerset.LeaderWorkerSet{}
 	if err := r.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, lws); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The LeaderWorkerSet is gone: drop its metric series. A pod
+			// controller increment from a lagging cache can still recreate one
+			// afterwards; that series stays until the manager restarts.
+			metrics.ClearLeaderWorkerSet(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	metrics.InitLeaderWorkerSet(lws.Namespace, lws.Name)
 
 	if lws.DeletionTimestamp != nil {
 		if lws.Spec.PodTerminationPolicy == leaderworkerset.ParallelPodTerminationPolicy {
@@ -1346,7 +1354,7 @@ func buildLeaderPodTemplateApplyConfiguration(lws *leaderworkerset.LeaderWorkerS
 		podAnnotations[leaderworkerset.ExclusiveKeyAnnotationKey] = topologyKey
 	}
 	if lws.Spec.LeaderWorkerTemplate.SubGroupPolicy != nil {
-		podAnnotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey] = (string(*lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type))
+		podAnnotations[leaderworkerset.SubGroupPolicyTypeAnnotationKey] = string(ptr.Deref(lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.Type, leaderworkerset.SubGroupPolicyTypeLeaderWorker))
 		podAnnotations[leaderworkerset.SubGroupSizeAnnotationKey] = strconv.Itoa(int(*lws.Spec.LeaderWorkerTemplate.SubGroupPolicy.SubGroupSize))
 		if topologyKey, ok := utils.SubGroupExclusiveTopologyKey(lws); ok {
 			podAnnotations[leaderworkerset.SubGroupExclusiveKeyAnnotationKey] = topologyKey
