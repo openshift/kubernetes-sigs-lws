@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -228,6 +229,67 @@ func TestTargetedContainerNamesAndSpecInjection(t *testing.T) {
 	ok, err = InjectPodSpecClaims(cpuOnly, nil, "cd-unused")
 	if err != nil || ok || len(cpuOnly.ResourceClaims) != 0 {
 		t.Fatalf("expected zero-GPU podSpec to remain untouched, ok=%v err=%v claims=%+v", ok, err, cpuOnly.ResourceClaims)
+	}
+}
+
+func TestTargetedContainerNamesExplicitList(t *testing.T) {
+	restartAlways := corev1.ContainerRestartPolicyAlways
+	podSpec := &corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{Name: "model-loader"},
+			{Name: "proxy-sidecar", RestartPolicy: &restartAlways},
+		},
+		Containers: []corev1.Container{
+			{Name: "vllm", Resources: gpuResources("4")},
+			{Name: "metrics"},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		raw     string
+		want    []string
+		wantErr string
+	}{
+		{
+			name: "restartable sidecar initContainer",
+			raw:  "proxy-sidecar",
+			want: []string{"proxy-sidecar"},
+		},
+		{
+			name: "list replaces GPU auto-detection",
+			raw:  "metrics,proxy-sidecar",
+			want: []string{"metrics", "proxy-sidecar"},
+		},
+		{
+			name:    "regular initContainer is rejected",
+			raw:     "model-loader",
+			wantErr: "model-loader",
+		},
+		{
+			name:    "empty value is rejected",
+			raw:     "",
+			wantErr: "empty entry",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := TargetedContainerNames(podSpec, map[string]string{
+				leaderworkersetv1.ComputeDomainContainersAnnotationKey: tc.raw,
+			})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("TargetedContainerNames(%q) = %v, %v, want an error containing %q", tc.raw, sets.List(got), err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("TargetedContainerNames(%q) returned error: %v", tc.raw, err)
+			}
+			if diff := cmp.Diff(tc.want, sets.List(got)); diff != "" {
+				t.Fatalf("TargetedContainerNames(%q) (-want +got):\n%s", tc.raw, diff)
+			}
+		})
 	}
 }
 
@@ -1050,4 +1112,207 @@ type requestRecorder []reconcile.Request
 
 func (r *requestRecorder) Add(req reconcile.Request) {
 	*r = append(*r, req)
+}
+
+func TestLWSNeedsReplicaDomain(t *testing.T) {
+	enabled := map[string]string{
+		leaderworkersetv1.AutoComputeDomainAnnotationKey: leaderworkersetv1.AutoComputeDomainEnabled,
+	}
+	gpuTemplate := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "gpu", Resources: gpuResources("1")}},
+		},
+	}
+	cpuTemplate := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "cpu"}},
+		},
+	}
+
+	tests := []struct {
+		name string
+		lws  *leaderworkersetv1.LeaderWorkerSet
+		want bool
+	}{
+		{
+			name: "annotation absent",
+			lws: &leaderworkersetv1.LeaderWorkerSet{
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						WorkerTemplate: *gpuTemplate.DeepCopy(),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "enabled but no targeted container",
+			lws: &leaderworkersetv1.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: enabled},
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						WorkerTemplate: *cpuTemplate.DeepCopy(),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "enabled with GPU worker and nil leader template",
+			lws: &leaderworkersetv1.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: enabled},
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						WorkerTemplate: *gpuTemplate.DeepCopy(),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "enabled with GPU only in leader template",
+			lws: &leaderworkersetv1.LeaderWorkerSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: enabled},
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						LeaderTemplate: gpuTemplate.DeepCopy(),
+						WorkerTemplate: *cpuTemplate.DeepCopy(),
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LWSNeedsReplicaDomain(tc.lws); got != tc.want {
+				t.Fatalf("LWSNeedsReplicaDomain() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDisaggregatedSetNeedsSliceDomain(t *testing.T) {
+	sliceEnabled := map[string]string{
+		disaggregatedsetv1.AutoComputeDomainAnnotationKey: leaderworkersetv1.AutoComputeDomainEnabled,
+	}
+	gpuTemplate := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "gpu", Resources: gpuResources("1")}},
+		},
+	}
+	cpuTemplate := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "cpu"}},
+		},
+	}
+	gpuRole := func(name string) disaggregatedsetv1.DisaggregatedRoleSpec {
+		return disaggregatedsetv1.DisaggregatedRoleSpec{
+			Name: name,
+			LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						WorkerTemplate: *gpuTemplate.DeepCopy(),
+					},
+				},
+			},
+		}
+	}
+	cpuRole := func(name string) disaggregatedsetv1.DisaggregatedRoleSpec {
+		return disaggregatedsetv1.DisaggregatedRoleSpec{
+			Name: name,
+			LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{
+				Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+					LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+						WorkerTemplate: *cpuTemplate.DeepCopy(),
+					},
+				},
+			},
+		}
+	}
+	optedOut := func(role disaggregatedsetv1.DisaggregatedRoleSpec) disaggregatedsetv1.DisaggregatedRoleSpec {
+		role.Annotations = map[string]string{
+			disaggregatedsetv1.AutoComputeDomainAnnotationKey: leaderworkersetv1.AutoComputeDomainDisabled,
+		}
+		return role
+	}
+
+	tests := []struct {
+		name string
+		ds   *disaggregatedsetv1.DisaggregatedSet
+		want bool
+	}{
+		{
+			name: "annotation absent",
+			ds: &disaggregatedsetv1.DisaggregatedSet{
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{
+					Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{gpuRole("prefill")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "enabled but only CPU roles",
+			ds: &disaggregatedsetv1.DisaggregatedSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: sliceEnabled},
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{
+					Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{cpuRole("router")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "enabled and only the opted-out role has a GPU",
+			ds: &disaggregatedsetv1.DisaggregatedSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: sliceEnabled},
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{
+					Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{
+						cpuRole("router"),
+						optedOut(gpuRole("prefill")),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "enabled with an enrolled GPU role after a CPU role",
+			ds: &disaggregatedsetv1.DisaggregatedSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: sliceEnabled},
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{
+					Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{
+						cpuRole("router"),
+						gpuRole("decode"),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "enabled with GPU only in an enrolled role's leader template",
+			ds: &disaggregatedsetv1.DisaggregatedSet{
+				ObjectMeta: metav1.ObjectMeta{Annotations: sliceEnabled},
+				Spec: disaggregatedsetv1.DisaggregatedSetSpec{
+					Roles: []disaggregatedsetv1.DisaggregatedRoleSpec{{
+						Name: "prefill",
+						LeaderWorkerSetTemplateSpec: leaderworkersetv1.LeaderWorkerSetTemplateSpec{
+							Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+								LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
+									LeaderTemplate: gpuTemplate.DeepCopy(),
+									WorkerTemplate: *cpuTemplate.DeepCopy(),
+								},
+							},
+						},
+					}},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DisaggregatedSetNeedsSliceDomain(tc.ds); got != tc.want {
+				t.Fatalf("DisaggregatedSetNeedsSliceDomain() = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
