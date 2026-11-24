@@ -403,7 +403,10 @@ var _ = ginkgo.Describe("leaderWorkerSet e2e tests", func() {
 		testing.UpdateWorkerTemplate(ctx, k8sClient, lws)
 
 		testing.ExpectValidLeaderStatefulSet(ctx, k8sClient, lws, 7)
-		testing.ExpectValidServices(ctx, k8sClient, lws, 7)
+		// Surge groups only exist while the rollout is in flight, but they
+		// still must get their own per-replica headless services to provide
+		// the group's DNS identity.
+		testing.ExpectValidSurgeServices(ctx, k8sClient, lws, int(*lws.Spec.Replicas), 7)
 		// Rolling update completes.
 		testing.ExpectValidLeaderStatefulSet(ctx, k8sClient, lws, 4)
 		testing.ExpectValidWorkerStatefulSets(ctx, lws, k8sClient, true)
