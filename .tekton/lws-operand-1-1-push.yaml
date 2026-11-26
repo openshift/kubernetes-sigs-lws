@@ -7,8 +7,24 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: "false"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
-      == "release-5.0"
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push"
+      && target_branch == "release-5.0"
+      && (
+      ".tekton/lws-operand-1-1-push.yaml".pathChanged()
+      || "api/***".pathChanged()
+      || "client-go/***".pathChanged()
+      || "cmd/***".pathChanged()
+      || "config/***".pathChanged()
+      || "pkg/***".pathChanged()
+      || "vendor/***".pathChanged()
+      || "Dockerfile.ocp".pathChanged()
+      || "go.mod".pathChanged()
+      || "go.sum".pathChanged()
+      || "Makefile".pathChanged()
+      || "Makefile-deps.mk".pathChanged()
+      || "Makefile-ocp.mk".pathChanged()
+      )
   labels:
     appstudio.openshift.io/application: lws-operator-1-1
     appstudio.openshift.io/component: lws-operand-1-1
@@ -30,6 +46,10 @@ spec:
     value: Dockerfile.ocp
   - name: path-context
     value: .
+  - name: hermetic
+    value: "true"
+  - name: build-source-image
+    value: "true"
   pipelineSpec:
     description: |
       This pipeline is ideal for building multi-arch container images from a Containerfile while maintaining trust after pipeline customization.
